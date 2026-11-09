@@ -1,0 +1,23 @@
+{
+ "machine": {
+  "host": "cn14",
+  "machine_type": "cdac",
+  "gpus": [
+   "0, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05",
+   "1, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05",
+   "2, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05"
+  ]
+ },
+ "bench": "tts",
+ "items": 36,
+ "audio_s_total": 391,
+ "rtfx_single_stream": 1.1,
+ "rtf": {
+  "p50": 0.93
+ },
+ "latency_s": {
+  "p95": 29.2
+ },
+ "chars_per_audio_s": 7.3,
+ "peak_mem_gib": 6.7
+}

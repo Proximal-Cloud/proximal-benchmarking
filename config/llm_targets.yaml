@@ -1,0 +1,52 @@
+# The LLMs we benchmark. Each model listed here becomes its own line in the report
+# (4. Gemma 4 31B, 5. <next model>, ...), costed on student_day.llm in spec.yaml.
+# To add a model: add an entry here and a case for it in scripts/serve_llm.sh, then
+# list it in MODELS when you run (MODELS="gemma31b-w4 gemma26b-a4b-fp8" scripts/run_all.sh).
+#
+# name:         shown in the report
+# repo:         Hugging Face weights (the public benchmark reads the tokenizer from them)
+# api_price:    entry under api_reference.llm in spec.yaml to compare against
+# gpus:         how many GPUs the model occupies (the cost report charges for all of them)
+# local: true = our vLLM, so we can force exact output lengths and read /metrics
+
+models:
+  gemma31b-w4:
+    name: Gemma 4 31B
+    base_url: http://localhost:8001/v1
+    model: gemma31b-w4
+    repo: google/gemma-4-31B-it-qat-w4a16-ct
+    api_price: gemma-4-31b
+    gpus: 1
+    local: true
+  # Not benchmarked this round; uncomment to bring it back.
+  # gemma26b-a4b-fp8:
+  #   name: Gemma 4 26B-A4B
+  #   base_url: http://localhost:8002/v1
+  #   model: gemma26b-a4b-fp8
+  #   repo: RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic
+  #   api_price: gemma-4-26b-a4b
+  #   gpus: 1
+  #   local: true
+
+# Socratic tutoring sessions (bench/llm_sessions.py). Defaults reproduce the spec's
+# per-student-day mix: 100 turns/day x (~1,000 new + ~20,000 cached in, 1,000 out).
+profiles:
+  socratic:
+    system_prompt_tokens: 12000     # shared Socratic/scaffolding prompt (identical for all students)
+    turn_new_input_tokens: 1000     # student message + RAG chunks, unique per turn
+    turn_output_tokens: 1000        # includes thinking
+    compact_at_tokens: 32000        # when the prompt would pass this, history is summarised
+    summary_tokens: 1500            # the summary that replaces history (uncached)
+    turns_per_student_day: 100      # = output_tokens / turn_output_tokens
+
+# Public benchmark (bench/standard_bench.py): vLLM's own `vllm bench serve`, the
+# tool behind most published vLLM throughput numbers. Same server, short prompts.
+standard_bench:
+  concurrency: [2, 4, 8, 16]              # requests in flight at once, like N students
+  prompts_per_concurrency: 25             # prompts per level = concurrency x this, clamped to [100, 1200]
+  datasets:
+    sharegpt:     # real ChatGPT conversations; vLLM keeps prompts <= 1,024 tokens and prompt+reply <= 2,048
+      path: ${INPUTS}/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+    random:       # synthetic fixed shape, vLLM's default: 1,024 tokens in, 128 out (not run by default)
+      input_len: 1024
+      output_len: 128

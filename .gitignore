@@ -1,0 +1,27 @@
+# Benchmark output and logs
+results/
+*.log
+
+# Downloaded or generated data (licences: internal benchmarking only)
+bench-inputs/
+dataset-cache/
+*.wav
+
+# Secrets and local settings: never commit these
+.env
+.env.*
+*.token
+.hf_token
+token
+.runtime
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venvs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

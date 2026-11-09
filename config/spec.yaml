@@ -1,0 +1,80 @@
+# Per-student daily usage spec and the economic assumptions the cost report uses.
+# Every number here is an input you can change; the report recomputes from it.
+
+student_day:
+  asr_minutes: 10            # 1. speech-to-text, minutes of student audio
+  tts_minutes: 10            # 2. text-to-speech, minutes of generated audio
+  ocr_pages: 10              # 3. homework / textbook pages uploaded
+  llm:                       # 4+. tutor LLM: each model in llm_targets.yaml is costed on this volume
+    cached_input_tokens: 2000000     # Socratic system prompt + history served from prefix cache
+    uncached_input_tokens: 100000    # new student text + RAG chunks
+    output_tokens: 100000            # includes thinking tokens
+
+billing:
+  days_per_month: 30         # set 22 if you bill only school days
+  target_usd_per_student_month: 2.00
+  inr_per_usd: 88.0          # update to the current rate before reporting
+
+# $ per GPU-hour by machine TYPE. Pick the machine when you run:
+#   MACHINE=cdac scripts/run_all.sh
+# The choice is saved with the results. If MACHINE isn't set, the report matches the
+# hostname the results came from against `hosts`, then falls back to default_machine.
+# The HTML report shows which price it used and lets you type another one;
+# to rewrite the report files at another price:
+#   python bench/cost_report.py --results <folder> --machine ryzen
+#   python bench/cost_report.py --results <folder> --usd-per-gpu-hour 0.35
+machines:
+  cdac:
+    label: C-DAC Airawat (cn14, A100 40GB PCIe)
+    usd_per_gpu_hour: 0.20
+    hosts: ["cn14*"]
+  ryzen:
+    label: Ryzen box
+    usd_per_gpu_hour: 0.50         # TBD: placeholder until the real cost is known
+    hosts: []
+default_machine: cdac
+
+gpu:
+  # Share of each 24h day a GPU does billable work. Students cluster in after-school
+  # hours, so this is the single biggest cost lever. 1.0 = pure compute cost.
+  utilization: 0.30
+
+# Latency targets used to pick each model's operating point (the highest load that
+# still meets these). Loosen or tighten to see the cost/latency trade-off.
+slo:
+  llm_ttft_p95_s: 3.0        # time to first token
+  llm_tpot_p95_ms: 60        # time per output token (~16 tok/s per student, faster than reading)
+  tts_realtime_margin: 1.2   # each stream must generate audio >= 1.2x faster than playback
+  asr_latency_p95_s: 2.0     # for a <=30 s utterance at batch 1
+  ocr_page_latency_p95_s: 15.0
+
+# Hosted prices, shown beside the self-hosted numbers. Verify before quoting.
+api_reference:
+  llm:                  # each model in llm_targets.yaml names its entry here with api_price:
+    gemma-4-31b: {usd_per_m_input: 0.12, usd_per_m_output: 0.35, usd_per_m_cached: 0.06}   # cheapest listed host (pricepertoken.com, Jul 2026)
+    # OpenRouter listing, Nov 2026 (no cached price listed, so cached = input). OpenCode's
+    # catalogue lists $0.04 in / $0.22 out / $0.02 cached.
+    gemma-4-26b-a4b: {usd_per_m_input: 0.022, usd_per_m_output: 0.067, usd_per_m_cached: 0.022}
+  bodhan_hosted:                        # console.bodhan.ai list prices (Sep 2026)
+    asr_inr_per_audio_minute: 0.10
+    tts_inr_per_10k_chars: 6.0
+    ocr_inr_per_image: 0.20
+  tts_chars_per_audio_second: 14.0      # overwritten by the measured value when the TTS bench has run
+
+# Target unit prices from the planning sheet, shown next to the measured unit costs.
+# [low, high] in US$; edit freely.
+market_reference:
+  asr_usd_per_min: [0.0007, 0.006]          # Whisper-class
+  tts_usd_per_m_chars: [1.0, 15.0]
+  ocr_usd_per_1k_pages: [1.0, 1.0]
+  llm_usd_per_m_cached: [0.01, 0.025]       # if cache-discounted
+  llm_usd_per_m_input: [0.10, 0.10]
+  llm_usd_per_m_output: [0.20, 0.20]
+
+report:
+  # Rows of the "cost by utilization" table (share of the day a GPU does useful work).
+  utilization_levels: [0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+
+not_costed_yet:                         # listed so the report shows them
+  - "Image generation (disabled in v0 or routed to a paid API)"
+  - "Web search, video search and other tools (marginal per-call cost)"

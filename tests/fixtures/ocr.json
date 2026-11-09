@@ -1,0 +1,55 @@
+{
+ "machine": {
+  "host": "cn14",
+  "machine_type": "cdac",
+  "gpus": [
+   "0, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05",
+   "1, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05",
+   "2, NVIDIA A100-PCIE-40GB, 40960 MiB, 595.71.05"
+  ]
+ },
+ "bench": "ocr",
+ "n_inputs": 20,
+ "levels": [
+  {
+   "workers": 1,
+   "pages_per_s": 0.11,
+   "latency_s": {
+    "p50": 6.26,
+    "p95": 31.44
+   },
+   "blocks_per_page": 13.6,
+   "errors": 0
+  },
+  {
+   "workers": 2,
+   "pages_per_s": 0.12,
+   "latency_s": {
+    "p50": 10.57,
+    "p95": 55.78
+   },
+   "blocks_per_page": 13.6,
+   "errors": 0
+  },
+  {
+   "workers": 4,
+   "pages_per_s": 0.12,
+   "latency_s": {
+    "p50": 20.65,
+    "p95": 109.7
+   },
+   "blocks_per_page": 14.1,
+   "errors": 0
+  },
+  {
+   "workers": 8,
+   "pages_per_s": 0.12,
+   "latency_s": {
+    "p50": 41.59,
+    "p95": 220.2
+   },
+   "blocks_per_page": 14.1,
+   "errors": 4
+  }
+ ]
+}
