@@ -104,8 +104,10 @@ if [ "$RUNTIME" = "docker" ]; then
 else
   [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
   # ZE_AFFINITY_MASK on Intel XPU; CUDA_VISIBLE_DEVICES on NVIDIA. Do not set both.
-  if [ "$GPU_BACKEND" = "xpu" ]; then HIDE=(-u CUDA_VISIBLE_DEVICES); else HIDE=(-u ZE_AFFINITY_MASK); fi
-  env "${GPU_VISIBLE_ENV}=$GPUS" HF_HUB_OFFLINE=1 "${HIDE[@]}" setsid nohup "${PIN[@]}" \
+  # Do not pass this through `env -u`: options after NAME=VALUE are treated as the program.
+  if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
+  export "${GPU_VISIBLE_ENV}=$GPUS" HF_HUB_OFFLINE=1
+  setsid nohup "${PIN[@]}" \
     "$VENVS/vllm/bin/vllm" serve "$MODEL" --host 127.0.0.1 --port "$PORT" "${ARGS[@]}" \
     > "$LOGDIR/tf-$name.log" 2>&1 < /dev/null &
   echo $! > "$LOGDIR/tf-$name.pid"
