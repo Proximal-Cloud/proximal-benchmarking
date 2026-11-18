@@ -194,8 +194,10 @@ class GpuSampler:
 
     def _read_xpu(self):
         # 0=engine util %, 1=power W, 18=memory used MiB. One sample, then return.
+        # xpu-smi v2 dropped the short flags -m/-n. Long flags work on v2.2.
         out = subprocess.run(
-            ["xpu-smi", "dump", "-d", "-1", "-m", "0,1,18", "-n", "1"],
+            ["xpu-smi", "dump", "-d", "-1", "--metrics", "0,1,18",
+             "--number", "1", "--format", "csv,nounits"],
             capture_output=True, text=True, timeout=20,
         ).stdout
         for parts in _csv_data_rows(out):
