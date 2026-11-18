@@ -26,7 +26,8 @@ $2/student-month target. Every $ figure in the report can be repriced in the bro
   That machine has `xpu-smi`, not `nvidia-smi`.
   The prep script installs the XPU vLLM wheel and does not install NVIDIA packages.
   - Gemma 4 31B (4-bit) needs one GPU with **40 GB or more**.
-    A 32 GB B70 may not fit the default 40K context.
+    A 32 GB B70 has about 3 GiB left for KV cache, and a 40K context needs about 7 GiB.
+    On that machine the serve script uses two B70s (tensor parallel).
   - ASR, TTS and OCR need about 10 GB each and run on another GPU, or on the same GPU afterwards on a 1-GPU machine.
 - **About 150 GB of free disk** for Python environments, model weights and test inputs.
 - **Internet access** from the machine (Hugging Face, PyPI). No sudo and no Docker needed.
@@ -264,6 +265,7 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | `Cannot find any model weights` | The cache has the tokenizer but not the weights. Re-run `scripts/01_download_models.sh`. Gemma 4 31B (4-bit) needs `model.safetensors`, about 23 GB. Do not delete the cache first: a partial file is resumed. |
 | `cannot find -lze_loader` | Triton needs the Level Zero loader to compile XPU kernels. `scripts/env.sh` adds a link when only `libze_loader.so.1` is installed. If the message says the library is missing, install it: `sudo apt-get install -y libze1 libze-dev`. |
 | `No such file or directory: 'ocloc'` | Triton needs the Intel offline compiler. Install the package that matches the compute runtime already on the machine: `sudo apt-get install -y intel-ocloc`. |
+| KV cache needed is larger than available memory | A 32 GB B70 cannot hold Gemma 4 31B (4-bit) and a 40K context on one GPU. Pull the latest scripts and re-run; they use GPUs 0 and 1. `TP=1 MAXLEN=3456` is only a smoke test and cannot run the 12K system prompt. |
 | Any benchmark failed | Its log is in `results/<machine>-<date-time>/<benchmark>.log`; vLLM server logs are in `$TF_HOME/logs/`. |
 
 ## Repository layout

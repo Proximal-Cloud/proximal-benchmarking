@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--tokenizer", default=None, help="tokenizer folder or repo (default: the target's repo)")
     ap.add_argument("--vllm", default=None, help="command that runs the vllm CLI (default: $VENVS/vllm/bin/vllm)")
     ap.add_argument("--gpus", default=None, help="GPU indices to sample, e.g. 0 or 1,2")
+    ap.add_argument("--gpu-count", type=int, default=None, help="override how many GPUs the deployment uses (for cost)")
     ap.add_argument("--timeout", type=float, default=3600, help="seconds allowed per level")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -73,6 +74,8 @@ def main():
     sb = cfg.get("standard_bench", {})
     if a.base_url:
         target["base_url"] = a.base_url
+    if a.gpu_count is not None:
+        target["gpus"] = a.gpu_count
     base = target["base_url"].rstrip("/")
     base = base[:-3] if base.endswith("/v1") else base
     levels_c = [int(x) for x in (a.concurrency.split(",") if a.concurrency else sb.get("concurrency", [2, 4, 8, 16]))]

@@ -41,7 +41,7 @@ if [ "$name" = "stop" ]; then
   exit 0
 fi
 
-MAXLEN=40960
+MAXLEN=${MAXLEN:-40960}
 EXTRA=()
 case "$name" in
   gemma31b-w4)
@@ -66,6 +66,9 @@ if [ -n "${GPU_IDS:-}" ]; then
   GPUS=$GPU_IDS
   case "$GPUS" in 0|0,*) CPUS=$CPUS_GPU0 ;; *) CPUS=$CPUS_GPU12 ;; esac
 fi
+# Expand a single XPU id to two cards when one card cannot hold this model.
+GPUS=$(model_gpus "$name" "$GPUS")
+case "$GPUS" in 0|0,*) CPUS=$CPUS_GPU0 ;; *) CPUS=$CPUS_GPU12 ;; esac
 PORT=${PORT_OVERRIDE:-$PORT}
 # CPU pinning uses cn14's core layout; skip it where those cores don't exist.
 PIN=(taskset -c "$CPUS")
@@ -75,6 +78,21 @@ if [ "$name" != "indic-speak" ]; then
   EXTRA+=(--language-model-only)             # text only: skip the vision tower, more room for KV cache
 fi
 [ "${KV_FP8:-0}" = "1" ] && EXTRA+=(--kv-cache-dtype fp8)
+tp_n=$(awk -F, '{print NF}' <<< "$GPUS")
+if [ "$tp_n" -gt 1 ] && [[ " ${EXTRA[*]-} " != *" --tensor-parallel-size "* ]]; then
+  EXTRA+=(--tensor-parallel-size "$tp_n")
+  # Single-node XPU does not need Ray. mp uses the GPUs in ZE_AFFINITY_MASK.
+  [ "$GPU_BACKEND" = "xpu" ] && EXTRA+=(--distributed-executor-backend mp)
+fi
+if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "$tp_n" -eq 1 ] && [ "${TP:-auto}" != "1" ]; then
+  echo "!! One XPU cannot hold --max-model-len $MAXLEN for $name."
+  echo "   A 32GB B70 has about 3 GiB left for KV cache; 40960 needs about 7 GiB."
+  echo "   Use two GPUs, or re-run with TP=1 MAXLEN=3456 for a smoke test only."
+  exit 1
+fi
+if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "$tp_n" -gt 1 ]; then
+  echo "== XPU: $name on GPU(s) $GPUS, tensor parallel $tp_n (one 32GB card cannot hold the 40K context)"
+fi
 
 ARGS=(--served-model-name "$name"
   --max-model-len "$MAXLEN" --gpu-memory-utilization "$MEM"

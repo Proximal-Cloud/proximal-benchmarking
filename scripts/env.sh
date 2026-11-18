@@ -56,6 +56,26 @@ if [ "$GPU_BACKEND" != "xpu" ]; then
   export VLLM_USE_FLASHINFER_SAMPLER=0
 fi
 
+# GPU list for one model. A 32GB B70 cannot hold Gemma 4 31B (4-bit) and a 40K
+# context on one card (about 3 GiB of KV cache left; 40K needs about 7 GiB).
+# Two cards fit the spec. Set TP=1 to keep a single card.
+model_gpus() { # $1 model name, $2 requested id or list
+  local name=$1 requested=${2:-0} n next
+  if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "${TP:-auto}" != "1" ]; then
+    case "$requested" in
+      *,*) printf '%s\n' "$requested" ;;
+      *)
+        n=$(gpu_count)
+        next=$((requested + 1))
+        if [ "${n:-0}" -gt "$next" ]; then printf '%s\n' "$requested,$next"
+        else printf '%s\n' "$requested"; fi
+        ;;
+    esac
+  else
+    printf '%s\n' "$requested"
+  fi
+}
+
 # Print how many GPUs the management tool can see. Echoes 0 if it cannot tell.
 gpu_count() {
   local n=""

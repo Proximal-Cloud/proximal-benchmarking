@@ -45,18 +45,20 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
   for name in ${MODELS:-$(cfg "print(' '.join(c['models']))")}; do
     repo=$(cfg "print(c['models']['$name']['repo'])") || { echo "!! $name is not in config/llm_targets.yaml"; continue; }
     if ! have_model "$repo"; then echo "!! skipping $name: $repo is not in $HF_HOME (run scripts/01_download_models.sh)"; continue; fi
-    echo "== LLM $name on GPU $LLM_GPU"
-    if GPU_IDS=$LLM_GPU MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+    serve_gpus=$(model_gpus "$name" "$LLM_GPU")
+    gpu_n=$(awk -F, '{print NF}' <<< "$serve_gpus")
+    echo "== LLM $name on GPU(s) $serve_gpus"
+    if GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
       if [ "${SKIP_SOCRATIC:-0}" != "1" ]; then
         echo "   Socratic sessions (~45 min; log: $RES/socratic_$name.log)"
-        "$PY" bench/llm_sessions.py --target "$name" --gpus "$LLM_GPU" $SOC_ARGS \
+        "$PY" bench/llm_sessions.py --target "$name" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
           --out "$RES/socratic_$name.json" > "$RES/socratic_$name.log" 2>&1
         tail -n 6 "$RES/socratic_$name.log"
       fi
       if [ "${SKIP_PUBLIC:-0}" != "1" ]; then
         if [ -s "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
           echo "   public benchmark, ShareGPT (~20 min; log: $RES/public_${name}_sharegpt.log)"
-          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --gpus "$LLM_GPU" $PUB_ARGS \
+          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --gpus "$serve_gpus" --gpu-count "$gpu_n" $PUB_ARGS \
             --out "$RES/public_${name}_sharegpt.json" > "$RES/public_${name}_sharegpt.log" 2>&1
           tail -n 4 "$RES/public_${name}_sharegpt.log"
         else

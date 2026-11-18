@@ -16,7 +16,7 @@ models:
     model: gemma31b-w4
     repo: google/gemma-4-31B-it-qat-w4a16-ct
     api_price: gemma-4-31b
-    gpus: 1
+    gpus: 1                 # 40GB+ card. A 32GB B70 serve uses 2 GPUs; run_all.sh records that count.
     local: true
   # Not benchmarked this round; uncomment to bring it back.
   # gemma26b-a4b-fp8:
