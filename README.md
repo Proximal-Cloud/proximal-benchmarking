@@ -262,6 +262,7 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | A script exits silently | Source `scripts/env.sh` first, and check `DATA_ROOT` points to a folder you can write to. |
 | Downloads keep stalling | Re-run the same script: downloads resume and finished files are skipped. |
 | `Cannot find any model weights` | The cache has the tokenizer but not the weights. Re-run `scripts/01_download_models.sh`. Gemma 4 31B (4-bit) needs `model.safetensors`, about 23 GB. Do not delete the cache first: a partial file is resumed. |
+| `cannot find -lze_loader` | Triton needs the Level Zero loader to compile XPU kernels. `scripts/env.sh` adds a link when only `libze_loader.so.1` is installed. If the message says the library is missing, install it: `sudo apt-get install -y libze1 libze-dev`. |
 | Any benchmark failed | Its log is in `results/<machine>-<date-time>/<benchmark>.log`; vLLM server logs are in `$TF_HOME/logs/`. |
 
 ## Repository layout

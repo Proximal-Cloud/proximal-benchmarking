@@ -78,4 +78,56 @@ print(len(devs))' || true)
 }
 
 # Hugging Face login is stored by huggingface_hub under $HF_HOME, never in this repo.
+
+# Triton compiles a small helper and links -lze_loader.
+# The driver package often installs only libze_loader.so.1, which the linker will not use.
+setup_xpu_ze_loader() {
+  [ "${GPU_BACKEND:-}" = "xpu" ] || return 0
+  local p real dir linkdir="$TF_HOME/xpu-link"
+  for p in \
+    /usr/lib/x86_64-linux-gnu/libze_loader.so \
+    /usr/lib64/libze_loader.so \
+    /usr/lib/libze_loader.so \
+    /usr/local/lib/libze_loader.so \
+    /usr/local/lib64/libze_loader.so
+  do
+    [ -e "$p" ] && return 0
+  done
+  real=""
+  if command -v ldconfig >/dev/null 2>&1; then
+    real=$(ldconfig -p 2>/dev/null | awk '/libze_loader\.so/ { print $NF; exit }')
+  fi
+  if [ -z "$real" ]; then
+    for p in \
+      /usr/lib/x86_64-linux-gnu/libze_loader.so.1 \
+      /usr/lib64/libze_loader.so.1 \
+      /lib/x86_64-linux-gnu/libze_loader.so.1 \
+      /usr/local/lib/libze_loader.so.1 \
+      /opt/intel/oneapi/lib/libze_loader.so \
+      /opt/intel/oneapi/lib/libze_loader.so.1 \
+      /opt/intel/oneapi/compiler/latest/lib/libze_loader.so \
+      /opt/intel/oneapi/level-zero/latest/lib/libze_loader.so
+    do
+      if [ -e "$p" ]; then real=$p; break; fi
+    done
+  fi
+  if [ -z "$real" ]; then
+    echo "!! libze_loader not found. Triton cannot compile XPU kernels." >&2
+    echo "   Install Level Zero, then re-run: sudo apt-get install -y libze1 libze-dev" >&2
+    return 0
+  fi
+  dir=$(dirname "$real")
+  if [ ! -e "$dir/libze_loader.so" ]; then
+    mkdir -p "$linkdir"
+    ln -sfn "$real" "$linkdir/libze_loader.so"
+    dir=$linkdir
+    echo "== XPU: Triton will link libze_loader via $linkdir" >&2
+  fi
+  case ":${LIBRARY_PATH:-}:" in
+    *":$dir:"*) ;;
+    *) export LIBRARY_PATH="$dir${LIBRARY_PATH:+:$LIBRARY_PATH}" ;;
+  esac
+}
+setup_xpu_ze_loader
+
 true  # sourcing must always succeed, or scripts using `set -e` exit silently
