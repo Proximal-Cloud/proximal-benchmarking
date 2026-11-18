@@ -12,6 +12,7 @@
 #                   (ShareGPT via vllm bench serve) at 2,4,8,16 requests at once
 #   Bodhan on the last GPU: TTS (one stream), ASR, OCR, then TTS batched on vLLM
 # Skip parts: SKIP_LLM=1 SKIP_SOCRATIC=1 SKIP_PUBLIC=1 SKIP_BODHAN=1 SKIP_TTS_VLLM=1
+# KEEP_LLM=1  do not stop or restart an LLM that is already serving
 # Quick dry run (~30 min, short levels):  QUICK=1 MACHINE=cdac scripts/run_all.sh
 set -uo pipefail   # no -e: one failed benchmark should not kill a 3-hour run
 cd "$(dirname "$0")/.."
@@ -48,7 +49,19 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
     serve_gpus=$(model_gpus "$name" "$LLM_GPU")
     gpu_n=$(awk -F, '{print NF}' <<< "$serve_gpus")
     echo "== LLM $name on GPU(s) $serve_gpus"
-    if GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+    base=$(cfg "print(c['models']['$name']['base_url'])")
+    started=0
+    if [ "${KEEP_LLM:-0}" = "1" ]; then
+      if curl -sf "$base/models" >/dev/null; then
+        echo "   already serving at $base; not restarting"
+        started=1
+      else
+        echo "!! KEEP_LLM=1 but $base is not answering. Start it with scripts/serve_llm.sh $name"
+      fi
+    elif GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+      started=1
+    fi
+    if [ "$started" = "1" ]; then
       if [ "${SKIP_SOCRATIC:-0}" != "1" ]; then
         echo "   Socratic sessions (~45 min; log: $RES/socratic_$name.log)"
         "$PY" bench/llm_sessions.py --target "$name" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
@@ -68,7 +81,7 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
     else
       echo "!! $name did not start; see $TF_HOME/logs/tf-$name.log"
     fi
-    scripts/serve_llm.sh stop "$name"
+    [ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop "$name"
   done
 fi
 
@@ -116,7 +129,7 @@ if [ "${SKIP_TTS_VLLM:-0}" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------- report
-scripts/serve_llm.sh stop all
+[ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop all
 "$PY" bench/cost_report.py --results "$RES" > "$RES/report.log" 2>&1 || { cat "$RES/report.log"; exit 1; }
 head -n 3 "$RES/report.log"
 cp "$RES/report.html" "results/report_$(basename "$RES").html"

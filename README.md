@@ -239,6 +239,7 @@ Set these in front of `scripts/run_all.sh`:
 | `QUICK=1` | short load levels (~30 min) |
 | `MODELS="a b"` | LLMs to run (default: all in `config/llm_targets.yaml`) |
 | `SKIP_LLM=1`, `SKIP_SOCRATIC=1`, `SKIP_PUBLIC=1` | skip all LLM benchmarks, or one of the two |
+| `KEEP_LLM=1` | do not stop or restart an LLM that is already serving |
 | `SKIP_BODHAN=1`, `SKIP_TTS_VLLM=1` | skip ASR/one-stream TTS/OCR, or the batched TTS |
 | `LLM_GPU=0`, `BODHAN_GPU=2` | which GPUs to use (defaults: first GPU for the LLM, last for the rest) |
 
