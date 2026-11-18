@@ -16,7 +16,14 @@ COMMON="pyyaml numpy soundfile huggingface_hub"
 
 if [ "${SEPARATE_ENVS:-0}" != "1" ]; then
   [ -x "$VENVS/vllm/bin/python" ] || { echo "!! no $VENVS/vllm yet: run scripts/00_prep_machine.sh first"; exit 1; }
-  VIRTUAL_ENV="$VENVS/vllm" uv pip install snac soundfile accelerate pyyaml
+  if [ "$GPU_BACKEND" = "xpu" ]; then
+    # Keep torch on the XPU index. A plain PyPI install can replace it with the CUDA wheel.
+    VIRTUAL_ENV="$VENVS/vllm" uv pip install --extra-index-url "$XPU_TORCH_INDEX" \
+      --extra-index-url "$XPU_TRITON_INDEX" --index-strategy unsafe-best-match \
+      snac soundfile accelerate pyyaml
+  else
+    VIRTUAL_ENV="$VENVS/vllm" uv pip install snac soundfile accelerate pyyaml
+  fi
   for e in asr tts ocr; do
     if [ -L "$VENVS/$e" ] || [ ! -e "$VENVS/$e" ]; then ln -sfn "$VENVS/vllm" "$VENVS/$e"; echo "== $VENVS/$e -> vllm env"
     else echo "== $VENVS/$e already exists as its own env; leaving it"; fi
@@ -27,7 +34,12 @@ fi
 
 echo "== ASR env"
 uv venv -q --python 3.11 "$VENVS/asr" 2>/dev/null || true
-VIRTUAL_ENV="$VENVS/asr" uv pip install --torch-backend=auto torch torchaudio
+if [ "$GPU_BACKEND" = "xpu" ]; then
+  VIRTUAL_ENV="$VENVS/asr" uv pip install --extra-index-url "$XPU_TORCH_INDEX" \
+    --index-strategy unsafe-best-match torch torchaudio
+else
+  VIRTUAL_ENV="$VENVS/asr" uv pip install --torch-backend=auto torch torchaudio
+fi
 VIRTUAL_ENV="$VENVS/asr" uv pip install transformers sentencepiece $COMMON
 if [ "${SKIP_NEMO:-0}" != "1" ]; then
   VIRTUAL_ENV="$VENVS/asr" uv pip install "nemo_toolkit[asr]" \
@@ -36,7 +48,12 @@ fi
 
 echo "== TTS env"
 uv venv -q --python 3.11 "$VENVS/tts" 2>/dev/null || true
-VIRTUAL_ENV="$VENVS/tts" uv pip install --torch-backend=auto torch
+if [ "$GPU_BACKEND" = "xpu" ]; then
+  VIRTUAL_ENV="$VENVS/tts" uv pip install --extra-index-url "$XPU_TORCH_INDEX" \
+    --index-strategy unsafe-best-match torch
+else
+  VIRTUAL_ENV="$VENVS/tts" uv pip install --torch-backend=auto torch
+fi
 VIRTUAL_ENV="$VENVS/tts" uv pip install "transformers>=5" accelerate snac $COMMON
 
 echo "== OCR env (runs the repo's own installer)"

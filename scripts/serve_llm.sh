@@ -83,18 +83,29 @@ ARGS=(--served-model-name "$name"
   "${EXTRA[@]}")
 
 stop_one "tf-$name"
-echo "== starting tf-$name ($RUNTIME): $MODEL on GPU(s) $GPUS, port $PORT"
+echo "== starting tf-$name ($RUNTIME, $GPU_BACKEND): $MODEL on GPU(s) $GPUS, port $PORT"
 if [ "$RUNTIME" = "docker" ]; then
-  docker run -d --name "tf-$name" \
-    --gpus "\"device=$GPUS\"" --ipc=host --shm-size 16g \
-    "${CPUSET[@]}" -p "$PORT:8000" \
-    -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
-    "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  if [ "$GPU_BACKEND" = "xpu" ]; then
+    docker run -d --name "tf-$name" \
+      --device /dev/dri -v /dev/dri/by-path:/dev/dri/by-path \
+      --ipc=host --shm-size 16g \
+      "${CPUSET[@]}" -p "$PORT:8000" \
+      -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e ZE_AFFINITY_MASK="$GPUS" \
+      "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  else
+    docker run -d --name "tf-$name" \
+      --gpus "\"device=$GPUS\"" --ipc=host --shm-size 16g \
+      "${CPUSET[@]}" -p "$PORT:8000" \
+      -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
+      "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  fi
   alive() { docker ps -q --filter "name=tf-$name" | grep -q .; }
   logs()  { docker logs --tail 60 "tf-$name"; }
 else
   [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
-  CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 setsid nohup "${PIN[@]}" \
+  # ZE_AFFINITY_MASK on Intel XPU; CUDA_VISIBLE_DEVICES on NVIDIA. Do not set both.
+  if [ "$GPU_BACKEND" = "xpu" ]; then HIDE=(-u CUDA_VISIBLE_DEVICES); else HIDE=(-u ZE_AFFINITY_MASK); fi
+  env "${GPU_VISIBLE_ENV}=$GPUS" HF_HUB_OFFLINE=1 "${HIDE[@]}" setsid nohup "${PIN[@]}" \
     "$VENVS/vllm/bin/vllm" serve "$MODEL" --host 127.0.0.1 --port "$PORT" "${ARGS[@]}" \
     > "$LOGDIR/tf-$name.log" 2>&1 < /dev/null &
   echo $! > "$LOGDIR/tf-$name.pid"

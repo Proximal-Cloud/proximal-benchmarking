@@ -4,6 +4,8 @@ Kept dependency-light (stdlib + PyYAML) so every benchmark venv can import it.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import platform
@@ -68,12 +70,72 @@ def summarize(values) -> dict:
     }
 
 
+def gpu_backend() -> str:
+    """xpu if xpu-smi is present, else cuda if nvidia-smi is present, else none.
+
+    GPU_BACKEND from scripts/env.sh overrides detection.
+    """
+    forced = os.environ.get("GPU_BACKEND")
+    if forced in ("xpu", "cuda", "none"):
+        return forced
+    if shutil.which("xpu-smi"):
+        return "xpu"
+    if shutil.which("nvidia-smi"):
+        return "cuda"
+    return "none"
+
+
+def _csv_data_rows(text: str) -> list[list[str]]:
+    rows = []
+    for parts in csv.reader(io.StringIO(text)):
+        parts = [p.strip() for p in parts]
+        if parts and parts[0][:1].isdigit():
+            rows.append(parts)
+    return rows
+
+
+def xpu_device_lines() -> list[str]:
+    """GPU lines in the same shape as nvidia-smi: 'id, name, memory, driver'."""
+    if not shutil.which("xpu-smi"):
+        return []
+    try:
+        out = subprocess.run(
+            ["xpu-smi", "discovery", "--dump", "1,2,8,16"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:
+        out = ""
+    lines = []
+    for parts in _csv_data_rows(out):
+        if len(parts) < 4:
+            continue
+        mem = parts[3].replace("MiB", "").strip()
+        try:
+            mem_txt = f"{float(mem):.0f} MiB"
+        except ValueError:
+            mem_txt = parts[3]
+        lines.append(f"{parts[0]}, {parts[1]}, {mem_txt}, {parts[2]}")
+    if lines:
+        return lines
+    try:
+        raw = subprocess.run(
+            ["xpu-smi", "discovery", "-j"], capture_output=True, text=True, timeout=20,
+        ).stdout
+        data = json.loads(raw)
+    except Exception:
+        return []
+    for dev in data.get("device_list") or data.get("deviceList") or []:
+        lines.append(f"{dev.get('device_id', '?')}, {dev.get('device_name', 'Intel XPU')}, unknown, unknown")
+    return lines
+
+
 class GpuSampler:
-    """Samples nvidia-smi once a second in a background thread.
+    """Samples the GPU tool once a second in a background thread.
 
     Records utilisation, memory and power for the given GPU indices so each
     benchmark can report mean utilisation, peak memory and energy used.
-    Silently does nothing on machines without nvidia-smi (e.g. the mock test).
+    Uses xpu-smi on Intel XPU and nvidia-smi on NVIDIA.
+    Silently does nothing when neither tool is present (e.g. the mock test).
     """
 
     FIELDS = "index,utilization.gpu,memory.used,memory.total,power.draw"
@@ -84,27 +146,65 @@ class GpuSampler:
         self.samples: list[dict] = []
         self._stop = threading.Event()
         self._thread = None
-        self.available = shutil.which("nvidia-smi") is not None
+        self.backend = gpu_backend()
+        self.available = self.backend in ("xpu", "cuda")
+        self._mem_total: dict[int, float] = {}
+        if self.backend == "xpu":
+            self._mem_total = self._xpu_memory_totals()
+
+    def _xpu_memory_totals(self) -> dict[int, float]:
+        totals = {}
+        for line in xpu_device_lines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                totals[int(parts[0])] = float(parts[2].replace("MiB", "").strip())
+            except ValueError:
+                continue
+        return totals
+
+    def _accept(self, idx: int, util: float, mem_mib: float, mem_total: float, power) -> None:
+        if self.gpu_indices is not None and idx not in self.gpu_indices:
+            return
+        self.samples.append({
+            "t": time.time(), "gpu": idx, "util": util,
+            "mem_mib": mem_mib, "mem_total_mib": mem_total, "power_w": power,
+        })
 
     def _read(self):
+        if self.backend == "xpu":
+            self._read_xpu()
+        else:
+            self._read_nvidia()
+
+    def _read_nvidia(self):
         out = subprocess.run(
             ["nvidia-smi", f"--query-gpu={self.FIELDS}", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         ).stdout
-        t = time.time()
-        for line in out.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
+        for parts in _csv_data_rows(out):
             if len(parts) < 5:
                 continue
             try:
-                idx = int(parts[0])
-                if self.gpu_indices is not None and idx not in self.gpu_indices:
-                    continue
-                self.samples.append({
-                    "t": t, "gpu": idx, "util": float(parts[1]),
-                    "mem_mib": float(parts[2]), "mem_total_mib": float(parts[3]),
-                    "power_w": float(parts[4]) if parts[4] not in ("[N/A]", "N/A") else None,
-                })
+                power = None if parts[4] in ("[N/A]", "N/A", "") else float(parts[4])
+                self._accept(int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), power)
+            except ValueError:
+                continue
+
+    def _read_xpu(self):
+        # 0=engine util %, 1=power W, 18=memory used MiB. One sample, then return.
+        out = subprocess.run(
+            ["xpu-smi", "dump", "-d", "-1", "-m", "0,1,18", "-n", "1"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+        for parts in _csv_data_rows(out):
+            if len(parts) < 5:
+                continue
+            try:
+                idx = int(parts[1])
+                power = None if parts[3] in ("", "N/A") else float(parts[3])
+                self._accept(idx, float(parts[2]), float(parts[4]), self._mem_total.get(idx, 0.0), power)
             except ValueError:
                 continue
 
@@ -155,7 +255,9 @@ class GpuSampler:
 def machine_info() -> dict:
     info = {"host": platform.node(), "python": platform.python_version(), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "machine_type": os.environ.get("TF_MACHINE") or None}
-    if shutil.which("nvidia-smi"):
+    if gpu_backend() == "xpu":
+        info["gpus"] = xpu_device_lines()
+    elif shutil.which("nvidia-smi"):
         try:
             info["gpus"] = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version", "--format=csv,noheader"],

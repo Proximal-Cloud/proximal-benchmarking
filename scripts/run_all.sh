@@ -26,7 +26,7 @@ mkdir -p "$RES"
 echo "== run $STAMP on ${TF_MACHINE:-hostname $(hostname -s)}; results in $RES; client python: $PY"
 [ -n "$TF_MACHINE" ] || echo "   (MACHINE not set: the report will pick the price by hostname; set MACHINE=cdac to be explicit)"
 
-NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true); NGPU=${NGPU:-1}; [ "$NGPU" -ge 1 ] || NGPU=1
+NGPU=$(gpu_count); NGPU=${NGPU:-0}; [ "$NGPU" -ge 1 ] || NGPU=1
 LLM_GPU=${LLM_GPU:-0}
 BODHAN_GPU=${BODHAN_GPU:-$((NGPU - 1))}    # cn14: GPU 2
 have_model() { ls -d "$HF_HOME/hub/models--${1//\//--}"/snapshots/*/ >/dev/null 2>&1; }
@@ -73,8 +73,9 @@ fi
 # ---------------------------------------------------------------- 1-3. Bodhan on the last GPU
 if [ "${SKIP_BODHAN:-0}" != "1" ]; then
   echo "== Bodhan models on GPU $BODHAN_GPU"
-  export CUDA_VISIBLE_DEVICES=$BODHAN_GPU
-  # --gpu only tells the telemetry sampler which GPU to watch (nvidia-smi numbering).
+  export "${GPU_VISIBLE_ENV}=$BODHAN_GPU"
+  if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
+  # --gpu only tells the telemetry sampler which GPU to watch.
   # TTS first: it writes the WAVs the ASR benchmark replays when there are no recordings.
   echo "   TTS, one stream end to end"
   "$VENVS/tts/bin/python" bench/tts_bench.py --mode hf --gpu "$BODHAN_GPU" --save-wav-dir "$INPUTS/tts_wavs" \
@@ -98,7 +99,7 @@ if [ "${SKIP_BODHAN:-0}" != "1" ]; then
   else
     echo "!! skipping OCR: no $VENVS/ocr environment yet"
   fi
-  unset CUDA_VISIBLE_DEVICES
+  unset "$GPU_VISIBLE_ENV"
 fi
 
 if [ "${SKIP_TTS_VLLM:-0}" != "1" ]; then

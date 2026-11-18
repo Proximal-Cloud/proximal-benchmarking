@@ -22,7 +22,11 @@ $2/student-month target. Every $ figure in the report can be repriced in the bro
 ## What you need
 
 - **Linux with NVIDIA GPUs** and a recent driver (tested: 3× A100 40GB PCIe, driver 595, CUDA 13.2, Ubuntu 24.04).
+  Intel XPU works too (for example B70 32GB).
+  That machine has `xpu-smi`, not `nvidia-smi`.
+  The prep script installs the XPU vLLM wheel and does not install NVIDIA packages.
   - Gemma 4 31B (4-bit) needs one GPU with **40 GB or more**.
+    A 32 GB B70 may not fit the default 40K context.
   - ASR, TTS and OCR need about 10 GB each and run on another GPU, or on the same GPU afterwards on a 1-GPU machine.
 - **About 150 GB of free disk** for Python environments, model weights and test inputs.
 - **Internet access** from the machine (Hugging Face, PyPI). No sudo and no Docker needed.
@@ -81,7 +85,9 @@ scripts/00_prep_machine.sh
 ```
 
 This checks the GPUs and disk, installs `uv`, then builds two environments:
-`$VENVS/vllm` (vLLM 0.23, ~10 GB) and `$VENVS/bench` (the benchmark clients).
+`$VENVS/vllm` (vLLM 0.23 on NVIDIA, vLLM 0.34 XPU on Intel, ~10 GB) and `$VENVS/bench` (the benchmark clients).
+On Intel, do not install the PyPI `vllm` package.
+That wheel is CUDA-only and pulls `nvidia-*` packages.
 
 ### 5. Log in to Hugging Face (once per machine)
 
@@ -250,8 +256,9 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | --- | --- |
 | `error: externally-managed-environment` from pip | Don't install into the system Python. Use the environments: `$VENVS/vllm/bin/python`, `$VENVS/bench/bin/python`. |
 | Hugging Face 401 / "gated repo" | Accept the model's terms on its Hugging Face page, then log in (step 5). |
-| Gemma fails to load with a `head_dim` error | transformers is too new: `VIRTUAL_ENV=$VENVS/vllm uv pip install transformers==5.12.1` |
-| vLLM fails with "Could not find nvcc" | Already handled by `VLLM_USE_FLASHINFER_SAMPLER=0` in `scripts/env.sh`; make sure you sourced it. |
+| Gemma fails to load with a `head_dim` error | On NVIDIA only: transformers is too new. `VIRTUAL_ENV=$VENVS/vllm uv pip install transformers==5.12.1`. Do not do this on Intel. |
+| `xpu-smi` rejects `--query-gpu`, or the vLLM install pulls `nvidia-*` | Re-run `scripts/00_prep_machine.sh`. Intel uses `xpu-smi discovery` and the XPU wheel. |
+| vLLM fails with "Could not find nvcc" | NVIDIA only. Already handled by `VLLM_USE_FLASHINFER_SAMPLER=0` in `scripts/env.sh`; make sure you sourced it. |
 | A script exits silently | Source `scripts/env.sh` first, and check `DATA_ROOT` points to a folder you can write to. |
 | Downloads keep stalling | Re-run the same script: downloads resume and finished files are skipped. |
 | Any benchmark failed | Its log is in `results/<machine>-<date-time>/<benchmark>.log`; vLLM server logs are in `$TF_HOME/logs/`. |

@@ -32,11 +32,15 @@ machines:
     label: Ryzen box
     usd_per_gpu_hour: 0.50         # TBD: placeholder until the real cost is known
     hosts: []
+  intel:
+    label: Intel (B70 32GB)
+    usd_per_gpu_hour: 0.23
+    hosts: ["b70-ws*s"]
 default_machine: cdac
 
 gpu:
   # Share of each 24h day a GPU does billable work. Students cluster in after-school
-  # hours, so this is the single biggest cost lever. 1.0 = pure compute cost.
+  # hours, so this is the single biggest cost lever. 1.0 = pure compuste cost.
   utilization: 0.30
 
 # Latency targets used to pick each model's operating point (the highest load that
