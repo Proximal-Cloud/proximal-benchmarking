@@ -130,4 +130,30 @@ setup_xpu_ze_loader() {
 }
 setup_xpu_ze_loader
 
+# Triton runs `ocloc` to turn SPIR-V into an XPU binary. It is a separate package
+# from the Level Zero loader, and it must be on PATH.
+setup_xpu_ocloc() {
+  [ "${GPU_BACKEND:-}" = "xpu" ] || return 0
+  command -v ocloc >/dev/null 2>&1 && return 0
+  local p
+  for p in \
+    /usr/bin/ocloc \
+    /usr/local/bin/ocloc \
+    /opt/intel/oneapi/ocloc/latest/bin/ocloc \
+    /opt/intel/oneapi/bin/ocloc \
+    /usr/lib/x86_64-linux-gnu/intel-opencl/ocloc
+  do
+    if [ -x "$p" ]; then
+      export PATH="$(dirname "$p"):${PATH}"
+      echo "== XPU: using ocloc at $p" >&2
+      return 0
+    fi
+  done
+  echo "!! ocloc not found. Triton cannot compile XPU kernels." >&2
+  echo "   Install the package that matches this machine's compute runtime:" >&2
+  echo "     sudo apt-get install -y intel-ocloc" >&2
+  return 0
+}
+setup_xpu_ocloc
+
 true  # sourcing must always succeed, or scripts using `set -e` exit silently

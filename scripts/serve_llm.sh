@@ -103,6 +103,11 @@ if [ "$RUNTIME" = "docker" ]; then
   logs()  { docker logs --tail 60 "tf-$name"; }
 else
   [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
+  if [ "$GPU_BACKEND" = "xpu" ] && ! command -v ocloc >/dev/null 2>&1; then
+    echo "!! ocloc is not on PATH. Triton cannot compile XPU kernels."
+    echo "   Install it, then re-run: sudo apt-get install -y intel-ocloc"
+    exit 1
+  fi
   # ZE_AFFINITY_MASK on Intel XPU; CUDA_VISIBLE_DEVICES on NVIDIA. Do not set both.
   # Do not pass this through `env -u`: options after NAME=VALUE are treated as the program.
   if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
