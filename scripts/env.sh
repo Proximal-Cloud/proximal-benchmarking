@@ -3,6 +3,9 @@
 # DATA_ROOT, which should be a disk with ~150 GB free. Default /data; on another
 # machine set it first, e.g.  export DATA_ROOT=$HOME/bench-data  (before sourcing).
 
+# Repo root, so the helpers below work from any working directory.
+BENCH_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
 export DATA_ROOT=${DATA_ROOT:-/data}
 export TF_HOME=${TF_HOME:-$DATA_ROOT/tokenfactory}     # venvs, inputs, logs
 export HF_HOME=${HF_HOME:-$DATA_ROOT/hf}               # Hugging Face cache (weights)
@@ -78,23 +81,20 @@ model_gpus() { # $1 model name, $2 requested id or list
 
 # Print how many GPUs the management tool can see. Echoes 0 if it cannot tell.
 gpu_count() {
-  local n=""
-  if [ "$GPU_BACKEND" = "xpu" ] && command -v xpu-smi >/dev/null 2>&1; then
-    n=$(xpu-smi discovery -j 2>/dev/null | python3 -c 'import json,sys
-raw=sys.stdin.read()
-try:
-    d=json.loads(raw)
-except Exception:
-    raise SystemExit
-devs=d.get("device_list") or d.get("deviceList") or []
-print(len(devs))' || true)
-    if [ -z "$n" ] || [ "$n" = "0" ]; then
-      n=$(xpu-smi discovery 2>/dev/null | grep -c 'Device Name:' || true)
-    fi
-  elif command -v nvidia-smi >/dev/null 2>&1; then
-    n=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
-  fi
-  echo "${n:-0}"
+  python3 "$BENCH_ROOT/bench/common.py" gpu-count 2>/dev/null || echo 0
+}
+
+# True when the Hugging Face cache holds a weight file for this repo.
+# A snapshot with only the tokenizer and config is left by an interrupted download.
+have_model() { # $1 = repo, e.g. google/gemma-4-31B-it-qat-w4a16-ct
+  local dir="$HF_HOME/hub/models--${1//\//--}/snapshots" f size
+  [ -d "$dir" ] || return 1
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+    [ "$size" -gt 1000000 ] && return 0
+  done < <(find "$dir" \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' -o -name '*.gguf' \) -print0)
+  return 1
 }
 
 # Hugging Face login is stored by huggingface_hub under $HF_HOME, never in this repo.

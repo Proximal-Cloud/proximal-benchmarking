@@ -30,7 +30,6 @@ echo "== run $STAMP on ${TF_MACHINE:-hostname $(hostname -s)}; results in $RES; 
 NGPU=$(gpu_count); NGPU=${NGPU:-0}; [ "$NGPU" -ge 1 ] || NGPU=1
 LLM_GPU=${LLM_GPU:-0}
 BODHAN_GPU=${BODHAN_GPU:-$((NGPU - 1))}    # cn14: GPU 2
-have_model() { ls -d "$HF_HOME/hub/models--${1//\//--}"/snapshots/*/ >/dev/null 2>&1; }
 cfg() { "$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; c = load_yaml('llm_targets.yaml'); $1"; }
 
 if [ "${QUICK:-0}" = "1" ]; then

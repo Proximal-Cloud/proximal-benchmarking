@@ -11,19 +11,6 @@ source scripts/env.sh
 unset HF_HUB_OFFLINE
 PY="$VENVS/bench/bin/python"; [ -x "$PY" ] || PY="$VENVS/vllm/bin/python"
 
-# A snapshot directory is not enough. A dropped download can leave the tokenizer
-# and config and no weights. Hugging Face stores weights as symlinks to blobs.
-have_model() {
-  local dir="$HF_HOME/hub/models--${1//\//--}/snapshots" f size
-  [ -d "$dir" ] || return 1
-  while IFS= read -r -d '' f; do
-    [ -f "$f" ] || continue
-    size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
-    [ "$size" -gt 1000000 ] && return 0
-  done < <(find "$dir" \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' -o -name '*.gguf' \) -print0)
-  return 1
-}
-
 # ---- models
 repos=$("$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; print(' '.join(m['repo'] for m in load_yaml('llm_targets.yaml')['models'].values()))")
 repos="$repos bodhan-ai/indic-transcribe-core bodhan-ai/indic-speak hubertsiuzdak/snac_24khz bodhan-ai/indic-ocr"
