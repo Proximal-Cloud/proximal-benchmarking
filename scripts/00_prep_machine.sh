@@ -13,7 +13,8 @@ source scripts/env.sh
 echo "== GPUs ($GPU_BACKEND)"
 # xpu-smi does not accept nvidia-smi --query-gpu flags. That is a different tool.
 if [ "$GPU_BACKEND" = "xpu" ]; then
-  # 1=id, 2=name, 8=driver, 16=memory. See: xpu-smi discovery -h
+  # --dump takes the ids of the fields to print, as listed by `xpu-smi discovery -h`.
+  # These four give the same columns as the nvidia-smi line below.
   xpu-smi discovery --dump 1,2,8,16 || xpu-smi discovery
 elif [ "$GPU_BACKEND" = "cuda" ]; then
   nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
@@ -41,12 +42,7 @@ export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-600}
 drop_nvidia_packages() {
   [ -x "$VENVS/vllm/bin/python" ] || return 0
   local names
-  names=$("$VENVS/vllm/bin/python" - <<'PY'
-import importlib.metadata as md
-print(" ".join(d.metadata["Name"] for d in md.distributions()
-               if (d.metadata.get("Name") or "").lower().startswith("nvidia")))
-PY
-)
+  names=$("$VENVS/vllm/bin/python" bench/common.py nvidia-packages)
   if [ -n "$names" ]; then
     echo "== removing leftover CUDA packages: $names"
     # Package names have no spaces.
@@ -58,7 +54,7 @@ echo "== vLLM env ($VENVS/vllm)"
 uv venv -q --python 3.12 "$VENVS/vllm" 2>/dev/null || true
 if [ "$GPU_BACKEND" = "xpu" ]; then
   # A previous CUDA install in this env pulls nvidia-* and cannot run on XPU.
-  if [ -x "$VENVS/vllm/bin/python" ] && ! "$VENVS/vllm/bin/python" -c 'import sys,torch; sys.exit(0 if getattr(torch.version, "xpu", None) else 1)' 2>/dev/null; then
+  if [ -x "$VENVS/vllm/bin/python" ] && ! "$VENVS/vllm/bin/python" bench/common.py has-xpu-torch 2>/dev/null; then
     echo "== removing CUDA torch from $VENVS/vllm"
     VIRTUAL_ENV="$VENVS/vllm" uv pip uninstall vllm torch torchvision torchaudio triton || true
   fi
@@ -72,21 +68,7 @@ if [ "$GPU_BACKEND" = "xpu" ]; then
     --extra-index-url "$XPU_KERNELS_INDEX" \
     --index-strategy unsafe-best-match
   drop_nvidia_packages
-  "$VENVS/vllm/bin/python" - <<'PY' || { echo "!! vLLM env does not have the Intel XPU torch build"; exit 1; }
-import importlib.metadata as md
-import importlib.util
-import sys
-import torch
-print("torch", torch.__version__, "xpu", getattr(torch.version, "xpu", None))
-xpu = bool(getattr(torch.version, "xpu", None)) or "+xpu" in torch.__version__
-left = [d.metadata["Name"] for d in md.distributions()
-        if (d.metadata.get("Name") or "").lower().startswith("nvidia")]
-spec = importlib.util.find_spec("nvidia")
-if left or spec is not None:
-    print("!! CUDA packages are still installed:", ", ".join(left) or getattr(spec, "origin", "nvidia"))
-if not xpu or left or spec is not None:
-    sys.exit(1)
-PY
+  "$VENVS/vllm/bin/python" bench/common.py check-xpu || { echo "!! vLLM env does not have the Intel XPU torch build"; exit 1; }
 else
   # transformers 5.12.1: newer releases fail to load Gemma 4 in vLLM 0.23 (head_dim error)
   VIRTUAL_ENV="$VENVS/vllm" uv pip install "vllm==0.23.0" "transformers==5.12.1"

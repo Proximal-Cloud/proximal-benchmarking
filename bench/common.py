@@ -11,6 +11,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -124,9 +125,71 @@ def xpu_device_lines() -> list[str]:
         data = json.loads(raw)
     except Exception:
         return []
+    if not isinstance(data, dict):
+        return []
     for dev in data.get("device_list") or data.get("deviceList") or []:
         lines.append(f"{dev.get('device_id', '?')}, {dev.get('device_name', 'Intel XPU')}, unknown, unknown")
     return lines
+
+
+def gpu_count() -> int:
+    """How many GPUs the management tool can see. 0 when it cannot tell."""
+    if gpu_backend() == "xpu" and shutil.which("xpu-smi"):
+        try:
+            raw = subprocess.run(
+                ["xpu-smi", "discovery", "-j"], capture_output=True, text=True, timeout=20,
+            ).stdout
+            data = json.loads(raw)
+        except Exception:
+            data = None
+        devs = (data.get("device_list") or data.get("deviceList") or []) if isinstance(data, dict) else []
+        if devs:
+            return len(devs)
+        try:
+            out = subprocess.run(
+                ["xpu-smi", "discovery"], capture_output=True, text=True, timeout=20,
+            ).stdout
+        except Exception:
+            return 0
+        return sum(1 for line in out.splitlines() if "Device Name:" in line)
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20,
+            ).stdout
+        except Exception:
+            return 0
+        return sum(1 for line in out.splitlines() if line.startswith("GPU"))
+    return 0
+
+
+def nvidia_package_names() -> list[str]:
+    """Installed packages named nvidia-*. An XPU environment must not keep them."""
+    import importlib.metadata as md
+
+    return sorted({d.metadata["Name"] for d in md.distributions()
+                   if (d.metadata.get("Name") or "").lower().startswith("nvidia")})
+
+
+def torch_has_xpu() -> bool:
+    """True when torch is the Intel XPU build."""
+    import torch
+
+    return bool(getattr(torch.version, "xpu", None)) or "+xpu" in torch.__version__
+
+
+def check_xpu_env() -> bool:
+    """True when torch is the XPU build and no CUDA packages are left behind."""
+    import importlib.util
+
+    import torch
+
+    print("torch", torch.__version__, "xpu", getattr(torch.version, "xpu", None))
+    left = nvidia_package_names()
+    spec = importlib.util.find_spec("nvidia")
+    if left or spec is not None:
+        print("!! CUDA packages are still installed:", ", ".join(left) or getattr(spec, "origin", "nvidia"))
+    return torch_has_xpu() and not left and spec is None
 
 
 class GpuSampler:
@@ -257,9 +320,10 @@ class GpuSampler:
 def machine_info() -> dict:
     info = {"host": platform.node(), "python": platform.python_version(), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "machine_type": os.environ.get("TF_MACHINE") or None}
-    if gpu_backend() == "xpu":
+    backend = gpu_backend()
+    if backend == "xpu":
         info["gpus"] = xpu_device_lines()
-    elif shutil.which("nvidia-smi"):
+    elif backend == "cuda":
         try:
             info["gpus"] = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version", "--format=csv,noheader"],
@@ -334,3 +398,25 @@ def edit_distance(a: list, b: list) -> int:
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y))
         prev = cur
     return prev[-1]
+
+
+def _main(argv: list[str]) -> int:
+    """Command line entry for the shell scripts, so they do not embed Python."""
+    cmd = argv[0] if argv else ""
+    if cmd == "gpu-count":
+        print(gpu_count())
+        return 0
+    if cmd == "nvidia-packages":
+        print(" ".join(nvidia_package_names()))
+        return 0
+    if cmd == "has-xpu-torch":
+        return 0 if torch_has_xpu() else 1
+    if cmd == "check-xpu":
+        return 0 if check_xpu_env() else 1
+    print(f"usage: {Path(__file__).name} {{gpu-count|nvidia-packages|has-xpu-torch|check-xpu}}",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))
