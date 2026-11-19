@@ -258,7 +258,7 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | --- | --- |
 | `error: externally-managed-environment` from pip | Don't install into the system Python. Use the environments: `$VENVS/vllm/bin/python`, `$VENVS/bench/bin/python`. |
 | Hugging Face 401 / "gated repo" | Accept the model's terms on its Hugging Face page, then log in (step 5). |
-| Gemma fails to load with a `head_dim` error | On NVIDIA only: transformers is too new. `VIRTUAL_ENV=$VENVS/vllm uv pip install transformers==5.12.1`. Do not do this on Intel. |
+| **On NVIDIA machines only**: Gemma fails to load with a `head_dim` error | transformers is too new. `VIRTUAL_ENV=$VENVS/vllm uv pip install transformers==5.12.1`. **Do not do this on Intel**. |
 | `xpu-smi` rejects `--query-gpu`, or the vLLM install pulls `nvidia-*` | Re-run `scripts/00_prep_machine.sh`. Intel uses `xpu-smi discovery` and the XPU wheel. |
 | vLLM fails with "Could not find nvcc" | NVIDIA only. Already handled by `VLLM_USE_FLASHINFER_SAMPLER=0` in `scripts/env.sh`; make sure you sourced it. |
 | A script exits silently | Source `scripts/env.sh` first, and check `DATA_ROOT` points to a folder you can write to. |

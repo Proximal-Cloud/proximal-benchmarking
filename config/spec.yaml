@@ -34,7 +34,7 @@ machines:
     hosts: []
   intel:
     label: Intel (B70 32GB)
-    usd_per_gpu_hour: 0.23
+    usd_per_gpu_hour: 0.23         # Arc Pro B70 rental price: https://gpus.io/en/gpus/arcprob70
     hosts: ["b70-ws*s"]
 default_machine: cdac
 
