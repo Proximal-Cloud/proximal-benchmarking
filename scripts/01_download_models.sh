@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Step 1: make sure the benchmark's models and data are on this machine. Safe to re-run.
-#   Models (Gemma 4 31B, Bodhan x3): checked in $HF_HOME; anything already there is skipped.
+#   Models (Gemma 4 31B, Bodhan x3): checked in $HF_HOME; a complete weight file is skipped.
+#   A snapshot that has only the tokenizer and config is incomplete and is downloaded again.
 #   ShareGPT (~650 MB, public): downloaded with curl, no Hugging Face login needed.
 # Needs no `hf` command and no pip install. A login is only needed if a gated model
 # (Gemma, Bodhan) is missing; the script says so and shows how.
@@ -10,14 +11,12 @@ source scripts/env.sh
 unset HF_HUB_OFFLINE
 PY="$VENVS/bench/bin/python"; [ -x "$PY" ] || PY="$VENVS/vllm/bin/python"
 
-have_model() { ls -d "$HF_HOME/hub/models--${1//\//--}"/snapshots/*/ >/dev/null 2>&1; }
-
 # ---- models
 repos=$("$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; print(' '.join(m['repo'] for m in load_yaml('llm_targets.yaml')['models'].values()))")
 repos="$repos bodhan-ai/indic-transcribe-core bodhan-ai/indic-speak hubertsiuzdak/snac_24khz bodhan-ai/indic-ocr"
 missing=()
 for r in $repos; do
-  if have_model "$r"; then echo "== $r: already here"; else echo "== $r: MISSING"; missing+=("$r"); fi
+  if have_model "$r"; then echo "== $r: already here"; else echo "== $r: MISSING or incomplete (no weight file)"; missing+=("$r"); fi
 done
 for r in "${missing[@]}"; do
   echo "== downloading $r"

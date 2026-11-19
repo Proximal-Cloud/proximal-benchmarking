@@ -41,7 +41,7 @@ if [ "$name" = "stop" ]; then
   exit 0
 fi
 
-MAXLEN=40960
+MAXLEN=${MAXLEN:-40960}
 EXTRA=()
 case "$name" in
   gemma31b-w4)
@@ -66,6 +66,9 @@ if [ -n "${GPU_IDS:-}" ]; then
   GPUS=$GPU_IDS
   case "$GPUS" in 0|0,*) CPUS=$CPUS_GPU0 ;; *) CPUS=$CPUS_GPU12 ;; esac
 fi
+# Expand a single XPU id to two cards when one card cannot hold this model.
+GPUS=$(model_gpus "$name" "$GPUS")
+case "$GPUS" in 0|0,*) CPUS=$CPUS_GPU0 ;; *) CPUS=$CPUS_GPU12 ;; esac
 PORT=${PORT_OVERRIDE:-$PORT}
 # CPU pinning uses cn14's core layout; skip it where those cores don't exist.
 PIN=(taskset -c "$CPUS")
@@ -75,6 +78,21 @@ if [ "$name" != "indic-speak" ]; then
   EXTRA+=(--language-model-only)             # text only: skip the vision tower, more room for KV cache
 fi
 [ "${KV_FP8:-0}" = "1" ] && EXTRA+=(--kv-cache-dtype fp8)
+tp_n=$(awk -F, '{print NF}' <<< "$GPUS")
+if [ "$tp_n" -gt 1 ] && [[ " ${EXTRA[*]-} " != *" --tensor-parallel-size "* ]]; then
+  EXTRA+=(--tensor-parallel-size "$tp_n")
+  # Single-node XPU does not need Ray. mp uses the GPUs in ZE_AFFINITY_MASK.
+  [ "$GPU_BACKEND" = "xpu" ] && EXTRA+=(--distributed-executor-backend mp)
+fi
+if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "$tp_n" -eq 1 ] && [ "${TP:-auto}" != "1" ]; then
+  echo "!! One XPU cannot hold --max-model-len $MAXLEN for $name."
+  echo "   A 32GB B70 has about 3 GiB left for KV cache; 40960 needs about 7 GiB."
+  echo "   Use two GPUs, or re-run with TP=1 MAXLEN=3456 for a smoke test only."
+  exit 1
+fi
+if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "$tp_n" -gt 1 ]; then
+  echo "== XPU: $name on GPU(s) $GPUS, tensor parallel $tp_n (one 32GB card cannot hold the 40K context)"
+fi
 
 ARGS=(--served-model-name "$name"
   --max-model-len "$MAXLEN" --gpu-memory-utilization "$MEM"
@@ -83,18 +101,36 @@ ARGS=(--served-model-name "$name"
   "${EXTRA[@]}")
 
 stop_one "tf-$name"
-echo "== starting tf-$name ($RUNTIME): $MODEL on GPU(s) $GPUS, port $PORT"
+echo "== starting tf-$name ($RUNTIME, $GPU_BACKEND): $MODEL on GPU(s) $GPUS, port $PORT"
 if [ "$RUNTIME" = "docker" ]; then
-  docker run -d --name "tf-$name" \
-    --gpus "\"device=$GPUS\"" --ipc=host --shm-size 16g \
-    "${CPUSET[@]}" -p "$PORT:8000" \
-    -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
-    "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  if [ "$GPU_BACKEND" = "xpu" ]; then
+    docker run -d --name "tf-$name" \
+      --device /dev/dri -v /dev/dri/by-path:/dev/dri/by-path \
+      --ipc=host --shm-size 16g \
+      "${CPUSET[@]}" -p "$PORT:8000" \
+      -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e ZE_AFFINITY_MASK="$GPUS" \
+      "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  else
+    docker run -d --name "tf-$name" \
+      --gpus "\"device=$GPUS\"" --ipc=host --shm-size 16g \
+      "${CPUSET[@]}" -p "$PORT:8000" \
+      -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
+      "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
+  fi
   alive() { docker ps -q --filter "name=tf-$name" | grep -q .; }
   logs()  { docker logs --tail 60 "tf-$name"; }
 else
   [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
-  CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 setsid nohup "${PIN[@]}" \
+  if [ "$GPU_BACKEND" = "xpu" ] && ! command -v ocloc >/dev/null 2>&1; then
+    echo "!! ocloc is not on PATH. Triton cannot compile XPU kernels."
+    echo "   Install it, then re-run: sudo apt-get install -y intel-ocloc"
+    exit 1
+  fi
+  # ZE_AFFINITY_MASK on Intel XPU; CUDA_VISIBLE_DEVICES on NVIDIA. Do not set both.
+  # Do not pass this through `env -u`: options after NAME=VALUE are treated as the program.
+  if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
+  export "${GPU_VISIBLE_ENV}=$GPUS" HF_HUB_OFFLINE=1
+  setsid nohup "${PIN[@]}" \
     "$VENVS/vllm/bin/vllm" serve "$MODEL" --host 127.0.0.1 --port "$PORT" "${ARGS[@]}" \
     > "$LOGDIR/tf-$name.log" 2>&1 < /dev/null &
   echo $! > "$LOGDIR/tf-$name.pid"

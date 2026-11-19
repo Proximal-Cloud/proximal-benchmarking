@@ -3,7 +3,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
-export CUDA_VISIBLE_DEVICES=${BODHAN_GPU:-$(( $(nvidia-smi -L | grep -c '^GPU') - 1 ))}
+if [ -z "${BODHAN_GPU:-}" ]; then
+  n=$(gpu_count); n=${n:-0}; [ "$n" -ge 1 ] || n=1
+  BODHAN_GPU=$((n - 1))
+fi
+export "${GPU_VISIBLE_ENV}=$BODHAN_GPU"
+if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
 mkdir -p "$INPUTS/smoke"
 
 echo "== TTS: one Hindi sentence -> $INPUTS/smoke/hello.wav"

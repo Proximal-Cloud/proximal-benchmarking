@@ -12,6 +12,7 @@
 #                   (ShareGPT via vllm bench serve) at 2,4,8,16 requests at once
 #   Bodhan on the last GPU: TTS (one stream), ASR, OCR, then TTS batched on vLLM
 # Skip parts: SKIP_LLM=1 SKIP_SOCRATIC=1 SKIP_PUBLIC=1 SKIP_BODHAN=1 SKIP_TTS_VLLM=1
+# KEEP_LLM=1  do not stop or restart an LLM that is already serving
 # Quick dry run (~30 min, short levels):  QUICK=1 MACHINE=cdac scripts/run_all.sh
 set -uo pipefail   # no -e: one failed benchmark should not kill a 3-hour run
 cd "$(dirname "$0")/.."
@@ -26,10 +27,9 @@ mkdir -p "$RES"
 echo "== run $STAMP on ${TF_MACHINE:-hostname $(hostname -s)}; results in $RES; client python: $PY"
 [ -n "$TF_MACHINE" ] || echo "   (MACHINE not set: the report will pick the price by hostname; set MACHINE=cdac to be explicit)"
 
-NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true); NGPU=${NGPU:-1}; [ "$NGPU" -ge 1 ] || NGPU=1
+NGPU=$(gpu_count); NGPU=${NGPU:-0}; [ "$NGPU" -ge 1 ] || NGPU=1
 LLM_GPU=${LLM_GPU:-0}
 BODHAN_GPU=${BODHAN_GPU:-$((NGPU - 1))}    # cn14: GPU 2
-have_model() { ls -d "$HF_HOME/hub/models--${1//\//--}"/snapshots/*/ >/dev/null 2>&1; }
 cfg() { "$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; c = load_yaml('llm_targets.yaml'); $1"; }
 
 if [ "${QUICK:-0}" = "1" ]; then
@@ -45,18 +45,32 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
   for name in ${MODELS:-$(cfg "print(' '.join(c['models']))")}; do
     repo=$(cfg "print(c['models']['$name']['repo'])") || { echo "!! $name is not in config/llm_targets.yaml"; continue; }
     if ! have_model "$repo"; then echo "!! skipping $name: $repo is not in $HF_HOME (run scripts/01_download_models.sh)"; continue; fi
-    echo "== LLM $name on GPU $LLM_GPU"
-    if GPU_IDS=$LLM_GPU MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+    serve_gpus=$(model_gpus "$name" "$LLM_GPU")
+    gpu_n=$(awk -F, '{print NF}' <<< "$serve_gpus")
+    echo "== LLM $name on GPU(s) $serve_gpus"
+    base=$(cfg "print(c['models']['$name']['base_url'])")
+    started=0
+    if [ "${KEEP_LLM:-0}" = "1" ]; then
+      if curl -sf "$base/models" >/dev/null; then
+        echo "   already serving at $base; not restarting"
+        started=1
+      else
+        echo "!! KEEP_LLM=1 but $base is not answering. Start it with scripts/serve_llm.sh $name"
+      fi
+    elif GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+      started=1
+    fi
+    if [ "$started" = "1" ]; then
       if [ "${SKIP_SOCRATIC:-0}" != "1" ]; then
         echo "   Socratic sessions (~45 min; log: $RES/socratic_$name.log)"
-        "$PY" bench/llm_sessions.py --target "$name" --gpus "$LLM_GPU" $SOC_ARGS \
+        "$PY" bench/llm_sessions.py --target "$name" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
           --out "$RES/socratic_$name.json" > "$RES/socratic_$name.log" 2>&1
         tail -n 6 "$RES/socratic_$name.log"
       fi
       if [ "${SKIP_PUBLIC:-0}" != "1" ]; then
         if [ -s "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
           echo "   public benchmark, ShareGPT (~20 min; log: $RES/public_${name}_sharegpt.log)"
-          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --gpus "$LLM_GPU" $PUB_ARGS \
+          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --gpus "$serve_gpus" --gpu-count "$gpu_n" $PUB_ARGS \
             --out "$RES/public_${name}_sharegpt.json" > "$RES/public_${name}_sharegpt.log" 2>&1
           tail -n 4 "$RES/public_${name}_sharegpt.log"
         else
@@ -66,15 +80,16 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
     else
       echo "!! $name did not start; see $TF_HOME/logs/tf-$name.log"
     fi
-    scripts/serve_llm.sh stop "$name"
+    [ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop "$name"
   done
 fi
 
 # ---------------------------------------------------------------- 1-3. Bodhan on the last GPU
 if [ "${SKIP_BODHAN:-0}" != "1" ]; then
   echo "== Bodhan models on GPU $BODHAN_GPU"
-  export CUDA_VISIBLE_DEVICES=$BODHAN_GPU
-  # --gpu only tells the telemetry sampler which GPU to watch (nvidia-smi numbering).
+  export "${GPU_VISIBLE_ENV}=$BODHAN_GPU"
+  if [ "$GPU_BACKEND" = "xpu" ]; then unset CUDA_VISIBLE_DEVICES; else unset ZE_AFFINITY_MASK; fi
+  # --gpu only tells the telemetry sampler which GPU to watch.
   # TTS first: it writes the WAVs the ASR benchmark replays when there are no recordings.
   echo "   TTS, one stream end to end"
   "$VENVS/tts/bin/python" bench/tts_bench.py --mode hf --gpu "$BODHAN_GPU" --save-wav-dir "$INPUTS/tts_wavs" \
@@ -98,7 +113,7 @@ if [ "${SKIP_BODHAN:-0}" != "1" ]; then
   else
     echo "!! skipping OCR: no $VENVS/ocr environment yet"
   fi
-  unset CUDA_VISIBLE_DEVICES
+  unset "$GPU_VISIBLE_ENV"
 fi
 
 if [ "${SKIP_TTS_VLLM:-0}" != "1" ]; then
@@ -113,7 +128,7 @@ if [ "${SKIP_TTS_VLLM:-0}" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------- report
-scripts/serve_llm.sh stop all
+[ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop all
 "$PY" bench/cost_report.py --results "$RES" > "$RES/report.log" 2>&1 || { cat "$RES/report.log"; exit 1; }
 head -n 3 "$RES/report.log"
 cp "$RES/report.html" "results/report_$(basename "$RES").html"
