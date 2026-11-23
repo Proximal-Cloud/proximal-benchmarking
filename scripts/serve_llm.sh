@@ -17,6 +17,7 @@
 #   PORT_OVERRIDE=9001   serve on another port
 #   LLM_STARTUP_TIMEOUT=2700   readiness timeout in seconds
 #   LLM_ENFORCE_EAGER=1   disable torch.compile and graph capture
+#   LLM_GPU_MEMORY_UTIL=0.80   override the fraction of GPU memory vLLM may use
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -126,7 +127,7 @@ if [ "$name" = gemma31b-w4 ] && [ -n "${GEMMA_REVISION:-}" ]; then
   EXTRA+=(--revision "$GEMMA_REVISION" --tokenizer-revision "$GEMMA_REVISION")
 fi
 ARGS=(--served-model-name "$name"
-  --max-model-len "$MAXLEN" --gpu-memory-utilization "$MEM"
+  --max-model-len "$MAXLEN" --gpu-memory-utilization "${LLM_GPU_MEMORY_UTIL:-$MEM}"
   --max-num-seqs "${MAX_SEQS:-64}"
   --enable-prefix-caching --enable-prompt-tokens-details
   "${EXTRA[@]}")
