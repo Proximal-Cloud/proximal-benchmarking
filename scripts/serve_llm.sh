@@ -15,6 +15,7 @@
 #   MAX_SEQS=N  cap on concurrent sequences (default 64; run_all.sh uses 256 for the short-request benchmark)
 #   GPU_IDS=0   put the model on other GPU(s) than its default, e.g. on a 1-GPU machine
 #   PORT_OVERRIDE=9001   serve on another port
+#   LLM_STARTUP_TIMEOUT=2700   readiness timeout in seconds
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -22,12 +23,14 @@ source scripts/env.sh
 RUNTIME=${RUNTIME:-$(cat "$TF_HOME/.runtime" 2>/dev/null || echo venv)}
 engine=${LLM_ENGINE:-vllm}
 prefix=tf-
+startup_default=900
 case "$engine" in
   vllm) ;;
   llm-scaler)
     [ "$GPU_BACKEND" = xpu ] || { echo "!! LLM Scaler requires Intel XPU" >&2; exit 1; }
     RUNTIME=docker
     prefix=tf-llm-scaler-
+    startup_default=2700
     VLLM_IMAGE=${LLM_SCALER_IMAGE:-intel/llm-scaler-vllm:1.5}
     ;;
   *) echo "!! unknown LLM_ENGINE: $engine" >&2; exit 1 ;;
@@ -59,6 +62,11 @@ if [ "$name" = "stop" ]; then
 fi
 
 service="$prefix$name"
+startup_timeout=${LLM_STARTUP_TIMEOUT:-$startup_default}
+if [[ ! "$startup_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "!! LLM_STARTUP_TIMEOUT must be a positive integer in seconds" >&2
+  exit 1
+fi
 MAXLEN=${MAXLEN:-40960}
 EXTRA=()
 case "$name" in
@@ -122,7 +130,7 @@ ARGS=(--served-model-name "$name"
   "${EXTRA[@]}")
 
 stop_one "$service"
-if curl -sf "http://localhost:$PORT/v1/models" >/dev/null; then
+if curl -sf --max-time 3 "http://localhost:$PORT/v1/models" >/dev/null; then
   echo "!! An LLM is already serving on port $PORT. Stop it before starting $service." >&2
   exit 1
 fi
@@ -181,10 +189,13 @@ else
   echo "   log: $LOGDIR/$service.log"
 fi
 
-echo -n "== waiting for http://localhost:$PORT (model load takes 2-10 min) "
-for i in $(seq 1 180); do
-  if curl -sf "http://localhost:$PORT/v1/models" >/dev/null; then echo " ready"; exit 0; fi
+echo -n "== waiting up to ${startup_timeout}s for http://localhost:$PORT "
+deadline=$((SECONDS + startup_timeout))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if curl -sf --max-time 3 "http://localhost:$PORT/v1/models" >/dev/null; then echo " ready"; exit 0; fi
   if ! alive; then echo; echo "!! server exited. Last log lines:"; logs; exit 1; fi
-  echo -n "."; sleep 5
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || break
+  echo -n "."; sleep "$((remaining < 5 ? remaining : 5))"
 done
-echo; echo "!! not ready after 15 min. Last log lines:"; logs; exit 1
+echo; echo "!! not ready after ${startup_timeout}s. Last log lines:"; logs; exit 1

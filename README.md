@@ -315,6 +315,9 @@ export LLM_SCALER_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0
 
 Replace `cached-snapshot-commit` with the snapshot used for both runs.
 Confirm both GPUs are idle and port 8001 is free before starting.
+The first LLM Scaler start can spend more than 15 minutes compiling and warming up XPU kernels.
+The launcher waits up to 45 minutes for LLM Scaler and 15 minutes for upstream vLLM.
+Set `LLM_STARTUP_TIMEOUT` in seconds to override either limit.
 
 ```bash
 for engine in vllm llm-scaler; do
