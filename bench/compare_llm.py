@@ -42,7 +42,7 @@ def main():
                 if level is None:
                     print(f"{row} Missing | — | — | — | — | — | — |")
                     continue
-                ttft = level["ttft_s" if socratic else "ttft_ms"]["p95"]
+                ttft = level["ttft_s" if socratic else "ttft_ms"].get("p95")
                 if ttft is not None and not socratic:
                     ttft /= 1000
                 throughput = level["output_tok_per_s" if socratic else "output_throughput"]
@@ -51,7 +51,7 @@ def main():
                 if cache is None:
                     cache = level.get("cache_hit_rate_metrics")
                 kv = level.get("kv_cache_usage_max")
-                values = [throughput, ttft, level["tpot_ms"]["p95"], errors,
+                values = [throughput, ttft, level["tpot_ms"].get("p95"), errors,
                           None if cache is None else cache * 100,
                           None if kv is None else kv * 100, level.get("preemptions")]
                 print(f"{row} " + " | ".join(map(number, values)) + " |")

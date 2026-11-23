@@ -149,6 +149,8 @@ def main():
     write_result(a.out or f"results/public_{a.target}_{a.dataset}.json", {
         "bench": "standard", "tool": "vllm bench serve", "target_name": a.target, "target": target,
         "dataset": a.dataset, "dataset_desc": desc, "tokenizer": tok, "levels": levels})
+    if any(not level["completed"] for level in levels):
+        sys.exit("No requests completed at one or more benchmark levels")
     if len(levels) != len(levels_c):
         sys.exit(f"Only {len(levels)} of {len(levels_c)} benchmark levels completed")
 

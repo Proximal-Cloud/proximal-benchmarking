@@ -49,7 +49,7 @@ def session_point(res, slo):
     good, best = [], None
     for lv in res["levels"]:
         t95, p95 = lv["ttft_s"].get("p95"), lv["tpot_ms"].get("p95")
-        if t95 is None or p95 is None or not lv["output_tok_per_s"]:
+        if lv.get("endpoint_failed") or t95 is None or p95 is None or not lv["output_tok_per_s"]:
             continue
         err_rate = lv["errors"] / max(1, lv["errors"] + lv["turns_completed_in_window"])
         if t95 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"] and err_rate < 0.01:
