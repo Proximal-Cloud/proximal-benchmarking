@@ -338,13 +338,14 @@ If LLM Scaler cannot serve the exact checkpoint at full context, keep its startu
 Use the same alternative checkpoint and precision on both stacks for a matched rerun.
 Comparisons with different quantization settings describe the deployed stacks.
 
-After both smoke tests pass, run the quick pair at concurrency 2 and 8.
-For the full comparison, omit `QUICK=1` and run three pairs at concurrency 2, 4, 8, and 16.
-Alternate engine order across pairs.
+After both smoke tests pass, run the paired benchmark with four concurrent Socratic students and sixteen concurrent ShareGPT requests.
+Use the standard measurement duration and prompt count.
+For repeated pairs, alternate engine order.
 
 ```bash
-QUICK=1 LLM_ENGINE=vllm scripts/run_all.sh &&
-QUICK=1 LLM_ENGINE=llm-scaler scripts/run_all.sh
+export QUICK=0 SOCRATIC_CONCURRENCY=4 PUBLIC_CONCURRENCY=16
+LLM_ENGINE=vllm scripts/run_all.sh &&
+LLM_ENGINE=llm-scaler scripts/run_all.sh
 ```
 
 Pass the printed result directories to the comparison script in run order.
@@ -357,3 +358,24 @@ The comparison shows throughput, p95 latency, errors, and available cache metric
 It marks missing levels and shows the Socratic operating point and GPU-seconds per student-day for each repeat.
 The `serve_*.log` files record launch arguments and the engine package or image ID.
 Keep these logs and the raw results with the report.
+
+### Profile a separate run with Intel APS
+
+Run the timed comparison first.
+Then collect APS profiles in a separate pass with the same engine settings and concurrency.
+APS launched this way profiles the host-side runner and its child processes.
+Docker starts the LLM Scaler workers outside that process tree.
+Use the benchmark's XPU telemetry for GPU measurements or attach VTune to the workers for server-side profiling.
+
+```bash
+source /opt/intel/oneapi/vtune/latest/apsvars.sh
+mkdir -p results/profiles
+engine=llm-scaler
+aps -r="results/profiles/aps-${engine}-$(date +%Y%m%d-%H%M%S)" \
+  env QUICK=0 LLM_ENGINE="$engine" SOCRATIC_CONCURRENCY=4 PUBLIC_CONCURRENCY=16 \
+  bash scripts/run_all.sh
+```
+
+Repeat with `engine=vllm` to profile the upstream run.
+Keep the APS report with its corresponding benchmark logs.
+[Intel APS guide](https://www.intel.com/content/www/us/en/docs/vtune-profiler/get-started-application-snapshot/2024-1/overview.html)

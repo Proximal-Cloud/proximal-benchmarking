@@ -24,14 +24,19 @@ def main():
     for run in args.runs:
         engine = (run / "llm_engine").read_text().strip()
         quick = (run / "quick").read_text().strip() == "1"
-        for workload, filename, expected in (
-            ("Socratic", f"socratic_{args.target}.json", [2, 4, 8, 16]),
-            ("ShareGPT", f"public_{args.target}_sharegpt.json", public_levels),
+        for workload, filename, concurrency_file, expected in (
+            ("Socratic", f"socratic_{args.target}.json", "socratic_concurrency", [2, 4, 8, 16]),
+            ("ShareGPT", f"public_{args.target}_sharegpt.json", "public_concurrency", public_levels),
         ):
             data = load(run / filename) or {"levels": []}
             levels = {level["concurrency"]: level for level in data["levels"]}
             socratic = workload == "Socratic"
-            for concurrency in [2, 8] if quick else expected:
+            configured = run / concurrency_file
+            if configured.is_file():
+                expected = [int(value) for value in configured.read_text().strip().split(",")]
+            elif quick:
+                expected = [2, 8]
+            for concurrency in expected:
                 level = levels.get(concurrency)
                 row = f"| {run.name} | {engine} | {workload} | {concurrency} |"
                 if level is None:

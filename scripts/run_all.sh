@@ -12,6 +12,7 @@
 #                   (ShareGPT via vllm bench serve) at 2,4,8,16 requests at once
 #   Bodhan on the last GPU: TTS (one stream), ASR, OCR, then TTS batched on vLLM
 # Skip parts: SKIP_LLM=1 SKIP_SOCRATIC=1 SKIP_PUBLIC=1 SKIP_BODHAN=1 SKIP_TTS_VLLM=1
+# SOCRATIC_CONCURRENCY and PUBLIC_CONCURRENCY override the workload concurrency lists.
 # KEEP_LLM=1  do not stop or restart an LLM that is already serving
 # Quick dry run (~30 min, short levels):  QUICK=1 MACHINE=cdac scripts/run_all.sh
 set -uo pipefail   # no -e: one failed benchmark should not kill a 3-hour run
@@ -50,13 +51,32 @@ BODHAN_GPU=${BODHAN_GPU:-$((NGPU - 1))}    # cn14: GPU 2
 cfg() { "$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; c = load_yaml('llm_targets.yaml'); $1"; }
 
 if [ "${QUICK:-0}" = "1" ]; then
-  SOC_ARGS="--concurrency 2,8 --duration 120 --warmup-turns 1 --no-stop-on-slo"; PUB_ARGS="--concurrency 2,8 --num-prompts 40"
+  socratic_default=2,8
+  public_default=2,8
+  SOC_ARGS=(--duration 120 --warmup-turns 1 --no-stop-on-slo)
+  PUB_ARGS=(--num-prompts 40)
   TTS_ARGS="--concurrency 1,8,32 --duration 40 --warmup 10"; OCR_ARGS="--workers 1,4 --pages-per-worker 5"
 else
-  SOC_ARGS="--concurrency 2,4,8,16 --duration 300 --warmup-turns 2 --no-stop-on-slo"; PUB_ARGS=""   # public levels: llm_targets.yaml
+  socratic_default=2,4,8,16
+  public_default=2,4,8,16
+  if [ "${SKIP_LLM:-0}" != 1 ] && [ -z "${PUBLIC_CONCURRENCY:-}" ]; then
+    public_default=$(cfg "print(','.join(map(str, c.get('standard_bench', {}).get('concurrency', [2, 4, 8, 16]))))") || exit 1
+  fi
+  SOC_ARGS=(--duration 300 --warmup-turns 2 --no-stop-on-slo)
+  PUB_ARGS=()
   TTS_ARGS="--concurrency 1,4,8,16,32,64 --duration 120 --warmup 20"; OCR_ARGS=""
 fi
 printf '%s\n' "${QUICK:-0}" > "$RES/quick"
+socratic_concurrency=${SOCRATIC_CONCURRENCY:-$socratic_default}
+public_concurrency=${PUBLIC_CONCURRENCY:-$public_default}
+for levels in "$socratic_concurrency" "$public_concurrency"; do
+  [[ "$levels" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || {
+    echo "!! concurrency must be a comma-separated list of positive integers" >&2
+    exit 1
+  }
+done
+printf '%s\n' "$socratic_concurrency" > "$RES/socratic_concurrency"
+printf '%s\n' "$public_concurrency" > "$RES/public_concurrency"
 
 # ---------------------------------------------------------------- 4+. LLMs on GPU 0
 if [ "${SKIP_LLM:-0}" != "1" ]; then
@@ -92,14 +112,16 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
     if [ "$started" = "1" ]; then
       if [ "${SKIP_SOCRATIC:-0}" != "1" ]; then
         echo "   Socratic sessions (~45 min; log: $RES/socratic_$name.log)"
-        "$PY" bench/llm_sessions.py --target "$name" --base-url "$base" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
+        "$PY" bench/llm_sessions.py --target "$name" --base-url "$base" --gpus "$serve_gpus" --gpu-count "$gpu_n" \
+          --concurrency "$socratic_concurrency" "${SOC_ARGS[@]}" \
           --out "$RES/socratic_$name.json" > "$RES/socratic_$name.log" 2>&1 || llm_status=1
         tail -n 6 "$RES/socratic_$name.log"
       fi
       if [ "${SKIP_PUBLIC:-0}" != "1" ]; then
         if [ -s "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
           echo "   public benchmark, ShareGPT (~20 min; log: $RES/public_${name}_sharegpt.log)"
-          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --base-url "$base" "${PUBLIC_CLIENT[@]}" "${TOKENIZER[@]}" --gpus "$serve_gpus" --gpu-count "$gpu_n" $PUB_ARGS \
+          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --base-url "$base" "${PUBLIC_CLIENT[@]}" "${TOKENIZER[@]}" --gpus "$serve_gpus" --gpu-count "$gpu_n" \
+            --concurrency "$public_concurrency" "${PUB_ARGS[@]}" \
             --out "$RES/public_${name}_sharegpt.json" > "$RES/public_${name}_sharegpt.log" 2>&1 || llm_status=1
           tail -n 4 "$RES/public_${name}_sharegpt.log"
         else
