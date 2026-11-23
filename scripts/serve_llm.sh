@@ -16,6 +16,7 @@
 #   GPU_IDS=0   put the model on other GPU(s) than its default, e.g. on a 1-GPU machine
 #   PORT_OVERRIDE=9001   serve on another port
 #   LLM_STARTUP_TIMEOUT=2700   readiness timeout in seconds
+#   LLM_ENFORCE_EAGER=1   disable torch.compile and graph capture
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -104,6 +105,7 @@ if [ "$name" != "indic-speak" ]; then
   EXTRA+=(--language-model-only)             # text only: skip the vision tower, more room for KV cache
 fi
 [ "${KV_FP8:-0}" = "1" ] && EXTRA+=(--kv-cache-dtype fp8)
+[ "${LLM_ENFORCE_EAGER:-0}" = "1" ] && EXTRA+=(--enforce-eager)
 tp_n=$(awk -F, '{print NF}' <<< "$GPUS")
 if [ "$tp_n" -gt 1 ] && [[ " ${EXTRA[*]-} " != *" --tensor-parallel-size "* ]]; then
   EXTRA+=(--tensor-parallel-size "$tp_n")

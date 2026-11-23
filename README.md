@@ -318,6 +318,8 @@ Confirm both GPUs are idle and port 8001 is free before starting.
 The first LLM Scaler start can spend more than 15 minutes compiling and warming up XPU kernels.
 The launcher waits up to 45 minutes for LLM Scaler and 15 minutes for upstream vLLM.
 Set `LLM_STARTUP_TIMEOUT` in seconds to override either limit.
+If XPU compilation exhausts host RAM and the system starts swapping, retry with `LLM_ENFORCE_EAGER=1`.
+Set this option for both engines when measuring a matched eager-mode comparison.
 
 ```bash
 for engine in vllm llm-scaler; do
