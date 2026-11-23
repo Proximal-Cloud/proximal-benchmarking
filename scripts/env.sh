@@ -91,7 +91,7 @@ have_model() { # $1 = repo, e.g. google/gemma-4-31B-it-qat-w4a16-ct
   [ -d "$dir" ] || return 1
   while IFS= read -r -d '' f; do
     [ -f "$f" ] || continue
-    size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+    size=$(stat -Lc%s "$f" 2>/dev/null || stat -Lf%z "$f" 2>/dev/null || echo 0)
     [ "$size" -gt 1000000 ] && return 0
   done < <(find "$dir" \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' -o -name '*.gguf' \) -print0)
   return 1
