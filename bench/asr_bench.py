@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -106,18 +108,18 @@ def norm_words(s: str) -> list[str]:
 
 
 class Backend:
-    def __init__(self, kind: str, model_dir: str):
+    def __init__(self, kind: str, model_dir: str, device: str):
         model_dir = resolve_model_dir(model_dir)
         self.kind, self.model_dir = kind, model_dir
         if kind == "nemo":
             sys.path.insert(0, f"{model_dir}/nemo")
             from load_nemo import load_nemo_model  # ships inside the model repo
             self.model = load_nemo_model(model_dir)
-            self.model.eval()
+            self.model.to(device).eval()
         else:
             sys.path.insert(0, model_dir)
             from indic_transcribe import IndicTranscribe  # ships inside the model repo
-            self.model = IndicTranscribe.from_pretrained(model_dir)
+            self.model = IndicTranscribe.from_pretrained(model_dir, device=device)
 
     def transcribe(self, paths: list[str], lang: str, batch_size: int) -> list[str]:
         if self.kind == "nemo":
@@ -144,28 +146,53 @@ def main():
     ap.add_argument("--latency-n", type=int, default=30, help="utterances timed one at a time")
     ap.add_argument("--batch-sizes", default="1,8,16,32,64")
     ap.add_argument("--throughput-audio-min", type=float, default=30.0, help="minutes of audio per batch-size run")
-    ap.add_argument("--gpu", type=int, default=None)
+    ap.add_argument("--device", choices=["cuda", "xpu", "cpu"], default=None,
+                    help="inference device (default: detected CUDA, XPU, or CPU)")
+    ap.add_argument("--gpu", type=int, default=None, help="physical GPU ID for telemetry")
     ap.add_argument("--out", default="results/asr.json")
     a = ap.parse_args()
 
     import torch
 
+    device = a.device
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        else:
+            device = "cpu"
+    accelerator = getattr(torch, device, None) if device != "cpu" else None
+    if device != "cpu" and (accelerator is None or not accelerator.is_available()):
+        ap.error(f"{device} is not available")
+    print(f"[device] {device}")
+
     utts = make_utterances(read_inputs(a), Path(a.work_dir), a.utt_seconds)
     print(f"[inputs] {len(utts)} utterances, {sum(u['audio_s'] for u in utts) / 60:.1f} min of audio")
 
+    if not utts:
+        ap.error("no audio utterances were prepared")
     t = time.perf_counter()
-    be = Backend(a.backend, a.model_dir)
+    be = Backend(a.backend, a.model_dir, device)
     load_s = time.perf_counter() - t
     be.transcribe([utts[0]["path"]], utts[0]["lang"], 1)  # warm-up
-    torch.cuda.reset_peak_memory_stats()
-    gpu = GpuSampler([a.gpu] if a.gpu is not None else None).start()
+    if accelerator:
+        accelerator.reset_peak_memory_stats()
+    gpu = GpuSampler([a.gpu] if a.gpu is not None else None).start() if accelerator else None
 
     # 1) batch-1 latency + quality
     lat, errs_w, errs_c, ref_w, ref_c = [], 0, 0, 0, 0
-    for u in (utts * (a.latency_n // len(utts) + 1))[: a.latency_n]:
-        torch.cuda.synchronize(); s = time.perf_counter()
+    latency_inputs = list(utts)
+    random.Random(0).shuffle(latency_inputs)
+    latency_inputs = (latency_inputs * (a.latency_n // len(utts) + 1))[: a.latency_n]
+    for u in latency_inputs:
+        if accelerator:
+            accelerator.synchronize()
+        s = time.perf_counter()
         hyp = be.transcribe([u["path"]], u["lang"], 1)[0]
-        torch.cuda.synchronize(); lat.append(time.perf_counter() - s)
+        if accelerator:
+            accelerator.synchronize()
+        lat.append(time.perf_counter() - s)
         if u["ref"]:
             rw, hw = norm_words(u["ref"]), norm_words(hyp)
             errs_w += edit_distance(rw, hw); ref_w += len(rw)
@@ -185,23 +212,29 @@ def main():
             by_lang.setdefault(u["lang"], []).append(u)
         reps = max(1, int(a.throughput_audio_min * 60 / sum(u["audio_s"] for u in utts)) + 1)
         audio = 0.0
-        torch.cuda.synchronize(); t0w, s = time.time(), time.perf_counter()
+        if accelerator:
+            accelerator.synchronize()
+        t0w, s = time.time(), time.perf_counter()
         for lang, us in by_lang.items():
             paths = [u["path"] for u in us] * reps
             be.transcribe(paths, lang, bs)
             audio += sum(u["audio_s"] for u in us) * reps
-        torch.cuda.synchronize(); wall = time.perf_counter() - s
+        if accelerator:
+            accelerator.synchronize()
+        wall = time.perf_counter() - s
         lv = {"batch_size": bs, "audio_s": audio, "wall_s": wall, "rtfx": audio / wall,
-              "gpu": gpu.window(t0w, time.time())}
+              "gpu": gpu.window(t0w, time.time()) if gpu else None}
         levels.append(lv)
         print(f"[throughput] batch {bs:3d}: RTFx {lv['rtfx']:.0f} ({audio / 60:.1f} min audio in {wall:.1f}s)")
-    gpu.stop()
+    if gpu:
+        gpu.stop()
 
     write_result(a.out, {
-        "bench": "asr", "backend": a.backend, "model_dir": be.model_dir, "load_s": load_s,
+        "bench": "asr", "backend": a.backend, "device": device, "model_dir": be.model_dir, "load_s": load_s,
         "utterance_s": a.utt_seconds, "latency_batch1_s": summarize(lat),
+        "latency_samples_by_language": dict(Counter(u["lang"] for u in latency_inputs)),
         "wer": errs_w / ref_w if ref_w else None, "cer": errs_c / ref_c if ref_c else None,
-        "throughput": levels, "peak_mem_gib": torch.cuda.max_memory_allocated() / 2 ** 30,
+        "throughput": levels, "peak_mem_gib": accelerator.max_memory_allocated() / 2 ** 30 if accelerator else None,
     })
 
 
