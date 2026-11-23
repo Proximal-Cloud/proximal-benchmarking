@@ -74,26 +74,41 @@ def run_hf(a, texts):
     sys.path.insert(0, model_dir)
     from inference import TTS  # ships inside the model repo
 
+    device = a.device
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        else:
+            device = "cpu"
+    accelerator = getattr(torch, device, None) if device != "cpu" else None
+    if device != "cpu" and (accelerator is None or not accelerator.is_available()):
+        raise SystemExit(f"{device} is not available")
+    print(f"[device] {device}")
     t_load = time.perf_counter()
-    tts = TTS(model_dir)
+    tts = TTS(model_dir, device=device)
     load_s = time.perf_counter() - t_load
     sr = getattr(tts, "sample_rate", 24000)
     wav_dir = Path(a.save_wav_dir)
     wav_dir.mkdir(parents=True, exist_ok=True)
 
-    # warm-up (CUDA kernels, caches)
+    # Warm up accelerator kernels and caches.
     tts(texts[0][2], speaker=texts[0][1], seed=0)
-    torch.cuda.reset_peak_memory_stats()
+    if accelerator:
+        accelerator.reset_peak_memory_stats()
 
-    gpu = GpuSampler([a.gpu] if a.gpu is not None else None).start()
+    gpu = GpuSampler([a.gpu] if a.gpu is not None else None).start() if accelerator else None
     rows, manifest = [], []
     t0 = time.time()
     for rep in range(a.repeats):
         for i, (lang, spk, text) in enumerate(texts):
-            torch.cuda.synchronize()
+            if accelerator:
+                accelerator.synchronize()
             s = time.perf_counter()
             wav = tts(text, speaker=spk, seed=1000 + i + rep)
-            torch.cuda.synchronize()
+            if accelerator:
+                accelerator.synchronize()
             wall = time.perf_counter() - s
             dur = len(wav) / sr
             rows.append({"lang": lang, "speaker": spk, "chars": len(text), "wall_s": wall,
@@ -104,20 +119,21 @@ def run_hf(a, texts):
                 manifest.append(f"{p}\t{lang}\t{text}")
             print(f"  [{lang}] {len(text):3d} chars -> {dur:5.2f}s audio in {wall:5.2f}s  (RTF {wall / dur:.2f})")
     t1 = time.time()
-    gpu.stop()
+    if gpu:
+        gpu.stop()
     (wav_dir / "manifest.tsv").write_text("\n".join(manifest) + "\n", encoding="utf-8")
 
     total_audio = sum(r["audio_s"] for r in rows)
     total_wall = sum(r["wall_s"] for r in rows)
     return {
-        "mode": "hf", "model_dir": model_dir, "load_s": load_s, "items": len(rows),
+        "mode": "hf", "device": device, "model_dir": model_dir, "load_s": load_s, "items": len(rows),
         "audio_s_total": total_audio, "wall_s_total": total_wall,
         "rtfx_single_stream": total_audio / total_wall,       # seconds of audio per GPU-second
         "rtf": summarize([r["rtf"] for r in rows]),
         "latency_s": summarize([r["wall_s"] for r in rows]),
         "chars_per_audio_s": sum(r["chars"] for r in rows) / total_audio,
-        "peak_mem_gib": torch.cuda.max_memory_allocated() / 2 ** 30,
-        "gpu": gpu.window(t0, t1), "rows": rows,
+        "peak_mem_gib": accelerator.max_memory_allocated() / 2 ** 30 if accelerator else None,
+        "gpu": gpu.window(t0, t1) if gpu else None, "rows": rows,
         "wav_manifest": str(wav_dir / "manifest.tsv"),
     }
 
@@ -253,6 +269,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2520)
     ap.add_argument("--stop", nargs="*", default=["<|end_of_speech|>", "<|end_of_ai|>"])
     ap.add_argument("--tokens-per-audio-s", type=float, default=SNAC_TOKENS_PER_AUDIO_S)
+    ap.add_argument("--device", choices=["cuda", "xpu", "cpu"], default=None,
+                    help="inference device for hf mode (default: detect CUDA, XPU, or CPU)")
     ap.add_argument("--gpu", type=int, default=None, help="GPU index to sample")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
