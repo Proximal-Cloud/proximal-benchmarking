@@ -18,6 +18,7 @@
 #   LLM_STARTUP_TIMEOUT=2700   readiness timeout in seconds
 #   LLM_ENFORCE_EAGER=1   disable torch.compile and graph capture
 #   LLM_GPU_MEMORY_UTIL=0.80   override the fraction of GPU memory vLLM may use
+#   LLM_MAX_BATCHED_TOKENS=1024   override the token budget per scheduler step
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -107,6 +108,9 @@ if [ "$name" != "indic-speak" ]; then
 fi
 [ "${KV_FP8:-0}" = "1" ] && EXTRA+=(--kv-cache-dtype fp8)
 [ "${LLM_ENFORCE_EAGER:-0}" = "1" ] && EXTRA+=(--enforce-eager)
+if [ -n "${LLM_MAX_BATCHED_TOKENS:-}" ]; then
+  EXTRA+=(--max-num-batched-tokens "$LLM_MAX_BATCHED_TOKENS")
+fi
 tp_n=$(awk -F, '{print NF}' <<< "$GPUS")
 if [ "$tp_n" -gt 1 ] && [[ " ${EXTRA[*]-} " != *" --tensor-parallel-size "* ]]; then
   EXTRA+=(--tensor-parallel-size "$tp_n")
