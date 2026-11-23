@@ -104,7 +104,7 @@ def main():
         for c in levels_c:
             n = a.num_prompts or min(1200, max(100, c * per_c))
             fn = f"c{c}.json"
-            cmd = vllm + ["bench", "serve", "--backend", "openai", "--base-url", base, "--endpoint", "/v1/completions",
+            cmd = vllm + ["bench", "serve", "--backend", "openai", "--base-url", base.removesuffix("/v1"), "--endpoint", "/v1/completions",
                           "--model", target["model"], "--tokenizer", tok, *ds_args,
                           "--num-prompts", str(n), "--max-concurrency", str(c), "--request-rate", "inf",
                           "--ignore-eos", "--temperature", "0", "--seed", "0",
@@ -149,6 +149,8 @@ def main():
     write_result(a.out or f"results/public_{a.target}_{a.dataset}.json", {
         "bench": "standard", "tool": "vllm bench serve", "target_name": a.target, "target": target,
         "dataset": a.dataset, "dataset_desc": desc, "tokenizer": tok, "levels": levels})
+    if len(levels) != len(levels_c):
+        sys.exit(f"Only {len(levels)} of {len(levels_c)} benchmark levels completed")
 
 
 if __name__ == "__main__":

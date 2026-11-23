@@ -72,6 +72,8 @@ async def chat(request):
 
 async def completions(request):
     body = await request.json()
+    if not body.get("stream"):
+        return web.json_response({"choices": [{"text": "two"}]})
     prompt = ntok(body.get("prompt", ""))
     state["prompt"] += prompt
     n_out = body.get("max_tokens", 16)

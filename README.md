@@ -287,3 +287,67 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | `tests/` | end-to-end test against a mock server, no GPU needed: `bash tests/test_end_to_end.sh` |
 
 Benchmark results, logs and downloaded data stay out of git (see `.gitignore`).
+
+## Compare LLM Scaler with upstream vLLM on Intel
+
+Use the same two Arc Pro B70s for both servers.
+LLM Scaler uses Docker and defaults to `intel/llm-scaler-vllm:1.5`.
+Upstream vLLM uses the existing runtime.
+Both runs use the cached Gemma 4 31B QAT checkpoint, 40,960 context tokens, and prefix caching.
+Intel documents online FP8 and symmetric INT4 for Gemma 4 31B.
+Confirm that the exact QAT checkpoint works in the smoke test before running the comparison.
+[Intel LLM Scaler release notes](https://github.com/intel/llm-scaler/releases/tag/vllm-1.5)
+
+Pull this benchmarking branch on the Intel host and run these commands from its checkout.
+Use the same upstream XPU environment as the earlier benchmark.
+If the environment or model cache needs setup, run `scripts/00_prep_machine.sh` and `scripts/01_download_models.sh` first.
+
+```bash
+source scripts/env.sh
+export MACHINE=intel MODELS=gemma31b-w4 LLM_GPU=0,1
+export SKIP_BODHAN=1 SKIP_TTS_VLLM=1 MAXLEN=40960 KV_FP8=0
+export VLLM_BENCH_CMD="$VENVS/vllm/bin/vllm"
+ls "$HF_HOME/hub/models--google--gemma-4-31B-it-qat-w4a16-ct/snapshots"
+export GEMMA_REVISION='cached-snapshot-commit'
+docker pull intel/llm-scaler-vllm:1.5
+export LLM_SCALER_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' intel/llm-scaler-vllm:1.5)"
+```
+
+Replace `cached-snapshot-commit` with the snapshot used for both runs.
+Confirm both GPUs are idle and port 8001 is free before starting.
+
+```bash
+for engine in vllm llm-scaler; do
+  if LLM_ENGINE="$engine" GPU_IDS="$LLM_GPU" scripts/serve_llm.sh gemma31b-w4 &&
+     scripts/smoke_llm.sh gemma31b-w4 8001; then
+    LLM_ENGINE="$engine" scripts/serve_llm.sh stop gemma31b-w4
+  else
+    echo "Smoke test failed for $engine"
+    break
+  fi
+done
+```
+
+If LLM Scaler cannot serve the exact checkpoint at full context, keep its startup logs.
+Use the same alternative checkpoint and precision on both stacks for a matched rerun.
+Comparisons with different quantization settings describe the deployed stacks.
+
+After both smoke tests pass, run the quick pair at concurrency 2 and 8.
+For the full comparison, omit `QUICK=1` and run three pairs at concurrency 2, 4, 8, and 16.
+Alternate engine order across pairs.
+
+```bash
+QUICK=1 LLM_ENGINE=vllm scripts/run_all.sh &&
+QUICK=1 LLM_ENGINE=llm-scaler scripts/run_all.sh
+```
+
+Pass the printed result directories to the comparison script in run order.
+
+```bash
+"$VENVS/bench/bin/python" bench/compare_llm.py "results/VLLM-RUN" "results/LLM-SCALER-RUN"
+```
+
+The comparison shows throughput, p95 latency, errors, and available cache metrics at each level.
+It marks missing levels and shows the Socratic operating point and GPU-seconds per student-day for each repeat.
+The `serve_*.log` files record launch arguments and the engine package or image ID.
+Keep these logs and the raw results with the report.

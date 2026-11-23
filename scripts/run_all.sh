@@ -21,9 +21,26 @@ export HF_HUB_OFFLINE=1            # everything is pre-downloaded; never wait on
 export TF_MACHINE=${MACHINE:-${TF_MACHINE:-}}   # saved with every result file
 PY="$VENVS/bench/bin/python"
 [ -x "$PY" ] || PY="$VENVS/vllm/bin/python"   # the vLLM env has everything the clients need
-STAMP=$(date +%Y%m%d-%H%M)
-RES="results/${TF_MACHINE:-$(hostname -s)}-$STAMP"
-mkdir -p "$RES"
+ENGINE=${LLM_ENGINE:-vllm}
+case "$ENGINE" in
+  vllm|llm-scaler) ;;
+  *) echo "!! unknown LLM_ENGINE: $ENGINE" >&2; exit 1 ;;
+esac
+if [ "$ENGINE" = llm-scaler ] && [ "${KEEP_LLM:-0}" = 1 ]; then
+  echo "!! LLM Scaler runs must start their own server to capture the engine configuration" >&2
+  exit 1
+fi
+STAMP=$(date +%Y%m%d-%H%M%S)
+mkdir -p results
+RES=$(mktemp -d "results/${TF_MACHINE:-$(hostname -s)}-$ENGINE-$STAMP-XXXXXX") || exit 1
+printf '%s\n' "$ENGINE" > "$RES/llm_engine"
+if [ "$GPU_BACKEND" = xpu ]; then
+  xpu-smi discovery --dump 1,2,8,16 > "$RES/xpu.log" 2>&1 || xpu-smi discovery >> "$RES/xpu.log" 2>&1
+fi
+PUBLIC_CLIENT=()
+PORT_OVERRIDE=${PORT_OVERRIDE:-}
+if [ -n "${VLLM_BENCH_CMD:-}" ]; then PUBLIC_CLIENT=(--vllm "$VLLM_BENCH_CMD"); fi
+llm_status=0
 echo "== run $STAMP on ${TF_MACHINE:-hostname $(hostname -s)}; results in $RES; client python: $PY"
 [ -n "$TF_MACHINE" ] || echo "   (MACHINE not set: the report will pick the price by hostname; set MACHINE=cdac to be explicit)"
 
@@ -33,22 +50,34 @@ BODHAN_GPU=${BODHAN_GPU:-$((NGPU - 1))}    # cn14: GPU 2
 cfg() { "$PY" -c "import sys; sys.path.insert(0, 'bench'); from common import load_yaml; c = load_yaml('llm_targets.yaml'); $1"; }
 
 if [ "${QUICK:-0}" = "1" ]; then
-  SOC_ARGS="--concurrency 2,8 --duration 120 --warmup-turns 1"; PUB_ARGS="--concurrency 2,8 --num-prompts 40"
+  SOC_ARGS="--concurrency 2,8 --duration 120 --warmup-turns 1 --no-stop-on-slo"; PUB_ARGS="--concurrency 2,8 --num-prompts 40"
   TTS_ARGS="--concurrency 1,8,32 --duration 40 --warmup 10"; OCR_ARGS="--workers 1,4 --pages-per-worker 5"
 else
   SOC_ARGS="--concurrency 2,4,8,16 --duration 300 --warmup-turns 2 --no-stop-on-slo"; PUB_ARGS=""   # public levels: llm_targets.yaml
   TTS_ARGS="--concurrency 1,4,8,16,32,64 --duration 120 --warmup 20"; OCR_ARGS=""
 fi
+printf '%s\n' "${QUICK:-0}" > "$RES/quick"
 
 # ---------------------------------------------------------------- 4+. LLMs on GPU 0
 if [ "${SKIP_LLM:-0}" != "1" ]; then
   for name in ${MODELS:-$(cfg "print(' '.join(c['models']))")}; do
-    repo=$(cfg "print(c['models']['$name']['repo'])") || { echo "!! $name is not in config/llm_targets.yaml"; continue; }
-    if ! have_model "$repo"; then echo "!! skipping $name: $repo is not in $HF_HOME (run scripts/01_download_models.sh)"; continue; fi
+    repo=$(cfg "print(c['models']['$name']['repo'])") || { echo "!! $name is not in config/llm_targets.yaml"; llm_status=1; continue; }
+    if ! have_model "$repo"; then echo "!! skipping $name: $repo is not in $HF_HOME (run scripts/01_download_models.sh)"; llm_status=1; continue; fi
     serve_gpus=$(model_gpus "$name" "$LLM_GPU")
     gpu_n=$(awk -F, '{print NF}' <<< "$serve_gpus")
     echo "== LLM $name on GPU(s) $serve_gpus"
     base=$(cfg "print(c['models']['$name']['base_url'])")
+    if [ -n "$PORT_OVERRIDE" ]; then base="http://localhost:$PORT_OVERRIDE/v1"; fi
+    TOKENIZER=()
+    if [ "$name" = gemma31b-w4 ] && [ -n "${GEMMA_REVISION:-}" ]; then
+      snapshot="$HF_HOME/hub/models--${repo//\//--}/snapshots/$GEMMA_REVISION"
+      if [ ! -s "$snapshot/config.json" ]; then
+        echo "!! pinned checkpoint is missing: $snapshot"
+        llm_status=1
+        continue
+      fi
+      TOKENIZER=(--tokenizer "$snapshot")
+    fi
     started=0
     if [ "${KEEP_LLM:-0}" = "1" ]; then
       if curl -sf "$base/models" >/dev/null; then
@@ -57,30 +86,37 @@ if [ "${SKIP_LLM:-0}" != "1" ]; then
       else
         echo "!! KEEP_LLM=1 but $base is not answering. Start it with scripts/serve_llm.sh $name"
       fi
-    elif GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name"; then
+    elif PORT_OVERRIDE="$PORT_OVERRIDE" GPU_IDS=$serve_gpus MAX_SEQS=64 scripts/serve_llm.sh "$name" 2>&1 | tee "$RES/serve_$name.log"; then
       started=1
     fi
     if [ "$started" = "1" ]; then
       if [ "${SKIP_SOCRATIC:-0}" != "1" ]; then
         echo "   Socratic sessions (~45 min; log: $RES/socratic_$name.log)"
-        "$PY" bench/llm_sessions.py --target "$name" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
-          --out "$RES/socratic_$name.json" > "$RES/socratic_$name.log" 2>&1
+        "$PY" bench/llm_sessions.py --target "$name" --base-url "$base" --gpus "$serve_gpus" --gpu-count "$gpu_n" $SOC_ARGS \
+          --out "$RES/socratic_$name.json" > "$RES/socratic_$name.log" 2>&1 || llm_status=1
         tail -n 6 "$RES/socratic_$name.log"
       fi
       if [ "${SKIP_PUBLIC:-0}" != "1" ]; then
         if [ -s "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
           echo "   public benchmark, ShareGPT (~20 min; log: $RES/public_${name}_sharegpt.log)"
-          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --gpus "$serve_gpus" --gpu-count "$gpu_n" $PUB_ARGS \
-            --out "$RES/public_${name}_sharegpt.json" > "$RES/public_${name}_sharegpt.log" 2>&1
+          "$PY" bench/standard_bench.py --target "$name" --dataset sharegpt --base-url "$base" "${PUBLIC_CLIENT[@]}" "${TOKENIZER[@]}" --gpus "$serve_gpus" --gpu-count "$gpu_n" $PUB_ARGS \
+            --out "$RES/public_${name}_sharegpt.json" > "$RES/public_${name}_sharegpt.log" 2>&1 || llm_status=1
           tail -n 4 "$RES/public_${name}_sharegpt.log"
         else
+          llm_status=1
           echo "!! skipping the public benchmark: ShareGPT isn't in $INPUTS/datasets (run scripts/01_download_models.sh)"
         fi
       fi
     else
-      echo "!! $name did not start; see $TF_HOME/logs/tf-$name.log"
+      llm_status=1
+      echo "!! $name did not start; see $RES/serve_$name.log"
     fi
-    [ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop "$name"
+    if [ "${KEEP_LLM:-0}" != "1" ]; then
+      if [ "$ENGINE" = llm-scaler ]; then
+        docker logs "tf-llm-scaler-$name" > "$RES/server_$name.log" 2>&1
+      fi
+      scripts/serve_llm.sh stop "$name"
+    fi
   done
 fi
 
@@ -118,20 +154,20 @@ fi
 
 if [ "${SKIP_TTS_VLLM:-0}" != "1" ]; then
   echo "== TTS batched on vLLM, GPU $BODHAN_GPU"
-  if GPU_IDS=$BODHAN_GPU scripts/serve_llm.sh indic-speak; then
+  if PORT_OVERRIDE= LLM_ENGINE=vllm GPU_IDS=$BODHAN_GPU scripts/serve_llm.sh indic-speak; then
     "$PY" bench/tts_bench.py --mode vllm --gpu "$BODHAN_GPU" $TTS_ARGS --out "$RES/tts_vllm.json" \
       > "$RES/tts_vllm.log" 2>&1; tail -n 4 "$RES/tts_vllm.log"
   else
     echo "!! Indic-Speak did not start under vLLM; see $TF_HOME/logs/tf-indic-speak.log (the single-stream TTS result still counts)"
   fi
-  scripts/serve_llm.sh stop indic-speak
+  LLM_ENGINE=vllm scripts/serve_llm.sh stop indic-speak
 fi
 
 # ---------------------------------------------------------------- report
-[ "${KEEP_LLM:-0}" = "1" ] || scripts/serve_llm.sh stop all
 "$PY" bench/cost_report.py --results "$RES" > "$RES/report.log" 2>&1 || { cat "$RES/report.log"; exit 1; }
 head -n 3 "$RES/report.log"
 cp "$RES/report.html" "results/report_$(basename "$RES").html"
 echo
 echo "Report: $(pwd)/results/report_$(basename "$RES").html"
 echo "All raw results and logs: $(pwd)/$RES"
+exit "$llm_status"

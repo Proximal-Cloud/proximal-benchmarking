@@ -342,7 +342,8 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
 
     q_d = (pick(m1, "prefix_cache_queries") or 0) - (pick(m0, "prefix_cache_queries") or 0)
     h_d = (pick(m1, "prefix_cache_hits") or 0) - (pick(m0, "prefix_cache_hits") or 0)
-    pre_d = (pick(m1, "num_preemptions") or 0) - (pick(m0, "num_preemptions") or 0)
+    pre_start = pick(m0, "num_preemptions")
+    pre_end = pick(m1, "num_preemptions")
     kv_vals = [v for g in gauges for v in [pick(g, "kv_cache_usage") or pick(g, "cache_usage_perc")] if v is not None]
     waiting = [pick(g, "num_requests_waiting") for g in gauges if pick(g, "num_requests_waiting") is not None]
 
@@ -369,7 +370,7 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
         },
         "cache_hit_rate_usage": (sum_cached / sum_prompt) if (have_cached and sum_prompt) else None,
         "cache_hit_rate_metrics": (h_d / q_d) if q_d else None,
-        "preemptions": pre_d if m1 else None,
+        "preemptions": pre_end - pre_start if pre_end is not None and pre_start is not None else None,
         "kv_cache_usage_max": max(kv_vals) if kv_vals else None,
         "requests_waiting_max": max(waiting) if waiting else None,
         "errors": sum(1 for r in records if not r["ok"]),
@@ -416,9 +417,10 @@ async def main_async(a):
 
     gpu = GpuSampler(a.gpus.split(",") if a.gpus else None).start()
     levels = []
+    concurrencies = [int(value) for value in a.concurrency.split(",")]
     slo = spec["slo"]
     try:
-        for c in [int(x) for x in a.concurrency.split(",")]:
+        for c in concurrencies:
             print(f"\n=== {a.profile}:{a.target}  concurrency={c}  warmup={a.warmup}s  window={a.duration}s ===")
             lv = await run_level(target, prof, c, a.warmup, a.duration, a.think_time, tf, system_text,
                                  prof["system_prompt_tokens"], force_len, extra_body, gpu, a.seed + c, a.grace,
@@ -449,6 +451,10 @@ async def main_async(a):
         "profile": prof, "tokens_per_word": tpw, "force_output_length": force_len,
         "think_time_s": a.think_time, "levels": levels,
     })
+    if not a.stop_on_slo and (len(levels) != len(concurrencies) or any(
+        level["errors"] and not level["turns_completed_in_window"] for level in levels
+    )):
+        raise SystemExit("Socratic sweep did not complete successfully")
 
 
 def main():

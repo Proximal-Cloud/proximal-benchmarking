@@ -9,6 +9,7 @@ python3 tests/mock_openai_server.py --port $PORT & MOCK=$!
 trap 'kill $MOCK 2>/dev/null; [ -n "${KEEP:-}" ] && cp "$OUT"/report.* "$KEEP"/; rm -rf "$OUT"' EXIT
 sleep 1.5
 export TF_MACHINE=cdac
+bash scripts/smoke_llm.sh mock "$PORT"
 python3 bench/llm_sessions.py --target gemma31b-w4 --base-url http://localhost:$PORT/v1 \
   --concurrency 2,8 --duration 25 --warmup-turns 2 --grace 60 --turn-output-tokens 80 \
   --out "$OUT/socratic_gemma31b-w4.json"
@@ -39,4 +40,15 @@ for lv in d["levels"]:
     assert abs(lv["cache_hit_rate_usage"] - lv["cache_hit_rate_metrics"]) < 0.05
 print("socratic checks passed; cache hit", round(d["levels"][-1]["cache_hit_rate_usage"], 3))
 PY
+mkdir "$OUT/vllm" "$OUT/llm-scaler"
+for engine in vllm llm-scaler; do
+  printf '%s\n' "$engine" > "$OUT/$engine/llm_engine"
+  printf '1\n' > "$OUT/$engine/quick"
+  cp "$OUT"/socratic_gemma31b-w4.json "$OUT/$engine/"
+done
+cp "$OUT"/public_gemma31b-w4_sharegpt.json "$OUT/vllm/"
+python3 bench/compare_llm.py "$OUT/vllm" "$OUT/llm-scaler" > "$OUT/compare.md"
+grep -q '| vllm | vllm | ShareGPT | 2 |' "$OUT/compare.md"
+grep -q '| llm-scaler | llm-scaler | ShareGPT | 8 | Missing |' "$OUT/compare.md"
+grep -q 'GPU-seconds per student-day' "$OUT/compare.md"
 echo "END-TO-END TEST PASSED"

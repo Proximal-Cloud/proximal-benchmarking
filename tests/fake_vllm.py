@@ -11,10 +11,11 @@ assert argv[:2] == ["bench", "serve"], argv
 ap = argparse.ArgumentParser()
 for k in ("--max-concurrency", "--num-prompts", "--random-input-len", "--random-output-len"):
     ap.add_argument(k, type=int, default=None)
-for k in ("--result-dir", "--result-filename", "--dataset-name", "--dataset-path", "--metric-percentiles", "--tokenizer", "--model"):
+for k in ("--result-dir", "--result-filename", "--dataset-name", "--dataset-path", "--metric-percentiles", "--tokenizer", "--model", "--base-url", "--endpoint"):
     ap.add_argument(k, default=None)
 a, _ = ap.parse_known_args(argv[2:])
 assert a.tokenizer and a.model, "tokenizer and model must be passed"
+assert not a.base_url.endswith("/v1") and a.endpoint == "/v1/completions"
 c, n = a.max_concurrency, a.num_prompts
 il, ol = (a.random_input_len, a.random_output_len) if a.dataset_name == "random" else (230, 200)
 tpot = 25 + c * 0.6                      # ms per token, grows with batch
