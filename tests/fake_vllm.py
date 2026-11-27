@@ -3,6 +3,7 @@
 vLLM 0.23 saves (--save-result), with made-up numbers that scale with concurrency."""
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +26,8 @@ ttft = 60 + c * 25                       # ms
 r = {"duration": dur, "completed": n, "failed": 0, "total_input_tokens": n * il, "total_output_tokens": n * ol,
      "request_throughput": n / dur, "output_throughput": out_tps, "total_token_throughput": n * (il + ol) / dur,
      "max_concurrent_requests": c, "max_concurrency": c}
+if os.environ.get("FAKE_PARTIAL"):
+    r.update(completed=1, failed=n - 1)
 for m, base in (("ttft", ttft), ("tpot", tpot), ("itl", tpot), ("e2el", ttft + tpot * ol)):
     r[f"mean_{m}_ms"] = r[f"median_{m}_ms"] = base
     for p in (a.metric_percentiles or "99").split(","):

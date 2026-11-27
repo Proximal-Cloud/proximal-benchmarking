@@ -34,6 +34,10 @@ python3 - "$OUT/socratic_gemma31b-w4.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 for lv in d["levels"]:
+    m = lv["measurement"]
+    assert m["status"] == "qualified"
+    assert len(lv["requests"]) == m["issued"] == m["completed"] == lv["turns_completed_in_window"]
+    assert m["joint_passed"] > 0 and all(r["outcome"] == "completed" for r in lv["requests"])
     assert lv["errors"] == 0, lv["error_samples"]
     assert lv["output_tok_per_s"] > 0 and lv["ttft_s"]["n"] > 0
     assert 0 < lv["cache_hit_rate_usage"] < 1
@@ -57,4 +61,29 @@ python3 bench/compare_llm.py "$OUT/vllm" > "$OUT/compare-custom.md"
 grep -q '| vllm | vllm | Socratic | 4 | Missing |' "$OUT/compare-custom.md"
 grep -q '| vllm | vllm | ShareGPT | 16 |' "$OUT/compare-custom.md"
 if grep -q '| vllm | vllm | ShareGPT | 2 |' "$OUT/compare-custom.md"; then exit 1; fi
+if FAKE_PARTIAL=1 python3 bench/standard_bench.py --target gemma31b-w4 --dataset random \
+    --tokenizer "$OUT/tok" --vllm "python3 tests/fake_vllm.py" --concurrency 2 --num-prompts 10 \
+    --out "$OUT/partial.json"; then
+  echo "FAIL: partial completions returned success"
+  exit 1
+fi
+python3 - "$OUT" <<'PYTEST'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+m = json.loads((root / "partial.json").read_text())["measurements"][0]
+assert (m["status"], m["issued"], m["completed"]) == ("failed", 10, 1), m
+report = json.loads((root / "report.json").read_text())
+assert report["evidence"] and "Run evidence" in (root / "report.html").read_text()
+assert "OCR" in " ".join(report["missing"])
+sys.path.insert(0, "bench")
+from paired_stats import median_interval
+assert median_interval([1] * 5) is None
+assert median_interval(list(range(6))) == (0, 5)
+from cost_report import session_point
+socratic = json.loads((root / "socratic_gemma31b-w4.json").read_text())
+for level in socratic["levels"]:
+    level["measurement"]["status"] = "failed"
+assert session_point(socratic, report["spec"]["slo"]) == (None, False)
+PYTEST
 echo "END-TO-END TEST PASSED"

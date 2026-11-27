@@ -185,7 +185,9 @@ The run goes in this order, and each benchmark's log goes in the run's folder as
 | 6 | TTS, batched on vLLM | 1–64 streams | ~20 min |
 | 7 | Cost report | | seconds |
 
-A failed benchmark doesn't stop the run; the report marks that line "not run yet".
+A failed benchmark leaves the other workloads available for reporting.
+Check its recorded outcomes and the runner log.
+The sweep writes trial starts, finishes, and exit codes to `trials.tsv`, including ASR fallback attempts.
 
 ### 12. Get the report
 
@@ -199,6 +201,43 @@ scp '<user>@<server>:<path to proximal-benchmarking>/results/report_<machine>-*.
 Open it in a browser. All raw results and logs are in `results/<machine>-<date-time>/`.
 
 ---
+
+## Comparing benchmark runs
+
+Choose the workload, target, load levels, and stop condition before collecting results.
+Use a fresh output directory per trial and record the model and tokenizer revisions, engine image, physical devices, and any shared workloads.
+Start each engine afresh, replay the same inputs and seed within each pair, and alternate which engine runs first.
+
+The public LLM test saturates each concurrency level by default.
+Set `PUBLIC_REQUEST_RATE=5` with `scripts/run_all.sh` or pass `--request-rate 5` to `bench/standard_bench.py` to offer five requests per second with the same concurrency cap.
+Repeat at increasing rates to find where latency increases or completions fall behind.
+The tutoring test models users who wait for each reply before issuing the next turn.
+
+The **Run evidence** table gives the counts, duration, stop reason, and observed status for each measured cohort.
+Qualification applies to the recorded criteria and observation window.
+For tutoring, at least 95% of issued turns must meet both latency targets and fewer than 1% may fail.
+Drained requests belong to the window in which they started.
+The result JSON retains their session, attempt, timestamps, outcome, and token counts.
+Older tutoring files remain available in the detailed report and need a new run to qualify for cost totals.
+
+For ASR, read WER and CER alongside the language counts and unique source clips.
+For OCR, the recorded check covers processing latency. Text accuracy needs reference pages.
+For TTS, the HF runner measures generated waveforms. The batched runner estimates audio length from tokens.
+Use the same held-out quality set when comparing models or quantization settings.
+
+Compare independent pairs at one load level with the following command.
+Repeat `--pair` for each pair, keeping the baseline first even when it ran second.
+
+```bash
+python3 bench/paired_stats.py --level 'concurrency 2' --metric joint_passes_per_min \
+  --pair results/a1/socratic_model.json results/b1/socratic_model.json \
+  --pair results/a2/socratic_model.json results/b2/socratic_model.json
+```
+
+The comparison prints every pair and the median within-pair difference.
+With at least six independent pairs it also gives a distribution-free 95% interval for the median difference.
+Six pairs can still give a wide interval.
+For a stability claim, fix the exposure in advance and keep stopped runs, elapsed time, and recovery logs alongside completed runs.
 
 ## Reading the report
 
