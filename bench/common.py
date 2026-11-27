@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -379,9 +380,30 @@ def machine_price(spec: dict, machine: dict, machine_override: str | None = None
     return out
 
 
+def measurement(name, issued, completed, duration_s, *, checks, stop_reason, planned=None,
+                unique_inputs=None, unit="requests"):
+    """Record one measured cohort. None represents evidence the runner could not collect."""
+    if False in checks.values():
+        status = "failed"
+    elif not issued or not completed or not checks or None in checks.values():
+        status = "insufficient evidence"
+    else:
+        status = "qualified"
+    return {"name": name, "unit": unit, "planned": planned, "issued": issued,
+            "completed": completed, "unique_inputs": unique_inputs, "duration_s": duration_s,
+            "checks": checks, "status": status, "stop_reason": stop_reason}
+
+
+def run_record(workload, criteria, stop_condition):
+    return {"version": 1, "id": str(uuid.uuid4()), "started_at": time.time(),
+            "workload": workload, "criteria": criteria, "stop_condition": stop_condition}
+
+
 def write_result(path: str | os.PathLike, payload: dict) -> Path:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    if "run" in payload:
+        payload["run"]["finished_at"] = time.time()
     payload = {"machine": machine_info(), **payload}
     with open(p, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)

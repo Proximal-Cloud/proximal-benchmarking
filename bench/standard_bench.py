@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import GpuSampler, load_yaml, resolve_model_dir, write_result  # noqa: E402
+from common import GpuSampler, measurement, run_record, load_yaml, resolve_model_dir, write_result  # noqa: E402
 
 PCTS = "50,90,95,99"
 
@@ -65,10 +65,17 @@ def main():
     ap.add_argument("--vllm", default=None, help="command that runs the vllm CLI (default: $VENVS/vllm/bin/vllm)")
     ap.add_argument("--gpus", default=None, help="GPU indices to sample, e.g. 0 or 1,2")
     ap.add_argument("--gpu-count", type=int, default=None, help="override how many GPUs the deployment uses (for cost)")
+    ap.add_argument("--request-rate", type=float, default=float("inf"),
+                    help="offered requests per second (default: saturate the concurrency limit)")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--timeout", type=float, default=3600, help="seconds allowed per level")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
+    if not a.request_rate > 0:
+        ap.error("--request-rate must be positive")
+    run = run_record(a.dataset, {"all_planned_requests_complete": True},
+                     {"concurrency": a.concurrency, "timeout_s_per_level": a.timeout})
     cfg = load_yaml("llm_targets.yaml")
     target = dict(cfg["models"][a.target])
     sb = cfg.get("standard_bench", {})
@@ -79,6 +86,8 @@ def main():
     base = target["base_url"].rstrip("/")
     base = base[:-3] if base.endswith("/v1") else base
     levels_c = [int(x) for x in (a.concurrency.split(",") if a.concurrency else sb.get("concurrency", [2, 4, 8, 16]))]
+    run["stop_condition"]["concurrency"] = levels_c
+    measurements = []
     per_c = sb.get("prompts_per_concurrency", 25)
     ds_cfg = (sb.get("datasets") or {}).get(a.dataset, {})
 
@@ -106,8 +115,8 @@ def main():
             fn = f"c{c}.json"
             cmd = vllm + ["bench", "serve", "--backend", "openai", "--base-url", base.removesuffix("/v1"), "--endpoint", "/v1/completions",
                           "--model", target["model"], "--tokenizer", tok, *ds_args,
-                          "--num-prompts", str(n), "--max-concurrency", str(c), "--request-rate", "inf",
-                          "--ignore-eos", "--temperature", "0", "--seed", "0",
+                          "--num-prompts", str(n), "--max-concurrency", str(c), "--request-rate", str(a.request_rate),
+                          "--ignore-eos", "--temperature", "0", "--seed", str(a.seed),
                           "--num-warmups", str(min(c, 16)),
                           "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", PCTS,
                           "--save-result", "--result-dir", str(tmp), "--result-filename", fn, "--disable-tqdm"]
@@ -116,10 +125,14 @@ def main():
             try:
                 proc = subprocess.run(cmd, timeout=a.timeout, capture_output=True, text=True)
             except subprocess.TimeoutExpired:
+                measurements.append(measurement(f"concurrency {c}", None, None, time.time() - t0,
+                                                planned=n, checks={"all_completed": False}, stop_reason="timeout"))
                 print(f"  timed out after {a.timeout:.0f}s; stopping the sweep")
                 break
             t1 = time.time()
             if proc.returncode != 0 or not (tmp / fn).exists():
+                measurements.append(measurement(f"concurrency {c}", None, None, t1 - t0, planned=n,
+                                                checks={"all_completed": False}, stop_reason="runner_failure"))
                 print(f"  vllm bench serve failed (exit {proc.returncode}). Last output:\n"
                       + "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-25:]))
                 if not levels:
@@ -134,23 +147,27 @@ def main():
                   "max_concurrent_requests": r.get("max_concurrent_requests"),
                   "ttft_ms": stats(r, "ttft"), "tpot_ms": stats(r, "tpot"), "itl_ms": stats(r, "itl"),
                   "e2el_ms": stats(r, "e2el"), "gpu": gpu.window(t0, t1)}
+            completed, failed = lv["completed"], lv["failed"]
+            issued = completed + failed if completed is not None else None
+            measurements.append(measurement(f"concurrency {c}", issued, completed, lv["duration_s"], planned=n,
+                                            checks={"all_completed": completed == n and failed == 0},
+                                            stop_reason="load_generator_finished"))
             levels.append(lv)
             mi = (lv["total_input_tokens"] or 0) / max(1, lv["completed"] or 1)
             mo = (lv["total_output_tokens"] or 0) / max(1, lv["completed"] or 1)
-            print(f"  {lv['output_throughput']:.0f} out tok/s | {lv['request_throughput']:.2f} req/s | "
+            print(f"  {lv['output_throughput']} out tok/s | {lv['request_throughput']} req/s | "
                   f"mean {mi:.0f} in / {mo:.0f} out tokens | TTFT p95 {(lv['ttft_ms']['p95'] or 0) / 1000:.2f}s | "
                   f"TPOT p95 {lv['tpot_ms']['p95'] or 0:.1f}ms | failed {lv['failed']}", flush=True)
     finally:
         gpu.stop()
         shutil.rmtree(tmp, ignore_errors=True)
 
-    if not levels:
-        sys.exit("no level completed")
     write_result(a.out or f"results/public_{a.target}_{a.dataset}.json", {
-        "bench": "standard", "tool": "vllm bench serve", "target_name": a.target, "target": target,
+        "bench": "standard", "run": run, "measurements": measurements,
+        "request_rate": str(a.request_rate), "seed": a.seed, "tool": "vllm bench serve", "target_name": a.target, "target": target,
         "dataset": a.dataset, "dataset_desc": desc, "tokenizer": tok, "levels": levels})
-    if any(not level["completed"] for level in levels):
-        sys.exit("No requests completed at one or more benchmark levels")
+    if any(m["status"] != "qualified" for m in measurements):
+        sys.exit("Benchmark incomplete: one or more levels did not complete all planned requests")
     if len(levels) != len(levels_c):
         sys.exit(f"Only {len(levels)} of {len(levels_c)} benchmark levels completed")
 

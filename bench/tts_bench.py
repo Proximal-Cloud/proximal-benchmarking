@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import GpuSampler, load_yaml, summarize, write_result, resolve_model_dir  # noqa: E402
+from common import GpuSampler, measurement, run_record, load_yaml, summarize, write_result, resolve_model_dir  # noqa: E402
 
 SNAC_TOKENS_PER_AUDIO_S = 7 * 24000 / 2048  # 82.03
 
@@ -154,6 +154,7 @@ async def one_tts(http, base_url, model, speaker, text, stops, max_tokens):
             "stream_options": {"include_usage": True},
             "add_special_tokens": False, "skip_special_tokens": False, "stop": stops}
     t0 = time.perf_counter()
+    finished = False
     first, chunks, usage, err = None, 0, None, None
     t_28 = None
     try:
@@ -168,6 +169,7 @@ async def one_tts(http, base_url, model, speaker, text, stops, max_tokens):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        finished = True
                         break
                     obj = json.loads(data)
                     if obj.get("usage"):
@@ -182,7 +184,9 @@ async def one_tts(http, base_url, model, speaker, text, stops, max_tokens):
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     e2e = time.perf_counter() - t0
-    n = (usage or {}).get("completion_tokens") or chunks
+    n = (usage or {}).get("completion_tokens") or 0
+    if err is None and (not finished or not n):
+        err = "incomplete stream or missing completion token count"
     return {"ok": err is None and n > 0, "error": err, "e2e_s": e2e, "ttft_s": first,
             "first_4_frames_s": t_28, "tokens": n, "hit_max_tokens": n >= max_tokens, "chars": len(text)}
 
@@ -203,9 +207,12 @@ async def run_vllm_level(a, texts, conc, duration, warmup):
                 r["t_end"] = time.time()
                 r["t_start"] = r["t_end"] - r["e2e_s"]
                 recs.append(r)
+                if not r["ok"]:
+                    await asyncio.sleep(1)
         await asyncio.gather(*[worker(w) for w in range(conc)])
     ok = [r for r in recs if r["ok"]]
-    win = [r for r in ok if r["t_start"] >= t_warm]
+    cohort = [r for r in recs if t_warm <= r["t_start"] < t_stop]
+    win = [r for r in cohort if r["ok"]]
     W = t_stop - t_warm
     tok_in_window = 0.0
     for r in ok:
@@ -223,7 +230,7 @@ async def run_vllm_level(a, texts, conc, duration, warmup):
         "e2e_s": summarize([r["e2e_s"] for r in win]),
         "audio_s_per_request": summarize([r["tokens"] / a.tokens_per_audio_s for r in win]),
         "share_hit_max_tokens": (sum(r["hit_max_tokens"] for r in win) / len(win)) if win else None,
-        "errors": sum(1 for r in recs if not r["ok"]),
+        "errors": len(cohort) - len(win),
         "error_samples": list({r["error"] for r in recs if r["error"]})[:3],
     }
 
@@ -274,9 +281,30 @@ def main():
     ap.add_argument("--gpu", type=int, default=None, help="GPU index to sample")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    margin = load_yaml("spec.yaml")["slo"]["tts_realtime_margin"]
+    metric = "waveform_rtfx_min" if a.mode == "hf" else "estimated_stream_p5_rtfx_min"
+    run = run_record(f"TTS {a.mode}", {metric: margin},
+                     {"repeats": a.repeats} if a.mode == "hf" else {"duration_s": a.duration, "warmup_s": a.warmup,
+                                                                   "concurrency": a.concurrency})
     texts = load_texts(a.texts)
     res = run_hf(a, texts) if a.mode == "hf" else run_vllm(a, texts)
-    write_result(a.out or f"results/tts_{a.mode}.json", {"bench": "tts", **res})
+    if a.mode == "hf":
+        measurements = [measurement("waveform synthesis", res["items"], res["items"], res["wall_s_total"],
+                                    planned=len(texts) * a.repeats, unique_inputs=len(set(tuple(t) for t in texts)),
+                                    unit="utterances", checks={"realtime": res["rtfx_single_stream"] >= margin},
+                                    stop_reason="repeat_limit")]
+    else:
+        measurements = []
+        for lv in res["levels"]:
+            completed = lv["requests_in_window"]
+            p5 = lv["stream_speed_x_realtime"].get("p5")
+            measurements.append(measurement(f"concurrency {lv['concurrency']} (audio token estimate)",
+                                            completed + lv["errors"], completed, lv["window_s"],
+                                            checks={"all_completed": not lv["errors"],
+                                                    "estimated_realtime": p5 >= margin if p5 is not None else None},
+                                            stop_reason="duration_elapsed"))
+    write_result(a.out or f"results/tts_{a.mode}.json", {"bench": "tts", "run": run,
+                                                        "measurements": measurements, **res})
 
 
 if __name__ == "__main__":

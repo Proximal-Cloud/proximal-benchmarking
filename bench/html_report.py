@@ -322,13 +322,13 @@ def render(ctx: dict) -> str:
                f'<span class="small muted">Results priced at ${price:.2f}/GPU-hour from {e(pricing["source"])} '
                f'(machine chosen by {e(pricing["why_machine"])}). Change it and every $ figure below updates.</span>'
                f'<span id="pnote" class="small chg" hidden>Showing a price you picked; report.md and report.json keep ${price:.2f}.</span></div>')
-    miss = f' Not yet measured, so left out of the totals: {e(", ".join(missing))}.' if missing else ""
+    miss = f' Missing qualified capacity for: {e(", ".join(missing))}.' if missing else ""
     out.append('<div class="kpis">'
                + kpi(D(pure_gs), f"per student-day, pure compute (GPU busy 100%) at {P}/GPU-hour")
                + kpi(D(pure_gs, mult=dpm, tgt=target), f"per student-month, pure compute ({dpm} days)")
                + kpi(D(pure_gs, div=util, mult=dpm, tgt=target), f"per student-month at {util:.0%} utilization")
                + kpi(money(target), "target per student-month") + "</div>")
-    with_llm = f" ASR + TTS + OCR + {e(llm_pick['model'])}." if llm_pick else ""
+    with_llm = " Included: " + ", ".join(e(r["model"]) for r in chosen) + "." if chosen else ""
     out.append(f'<p class="small muted">Pure compute charges only the GPU seconds the work actually used; real cost is that '
                f'divided by utilization (see the utilization table).{with_llm}{miss}</p>')
 
@@ -453,6 +453,14 @@ def render(ctx: dict) -> str:
                       "$/day pure compute", "Hosted API $/day", "Latency target", "Measured", "Met"],
                      trs, numeric={4, 5, 6}))
 
+    if ctx.get("evidence"):
+        out.append("<h2>Run evidence</h2>")
+        out.append(table(["Target / workload", "Level", "Issued", "Completed", "Unique inputs", "Seconds",
+                          "Joint passes/min", "Status", "Stop reason"],
+                         [[e(f"{r['target']} / {r['workload']}"), e(r["name"]), num(r["issued"], 0),
+                           num(r["completed"], 0), num(r["unique_inputs"], 0), num(r["duration_s"], 1),
+                           num(r.get("joint_passes_per_min"), 2), e(r["status"]), e(r["stop_reason"])]
+                          for r in ctx["evidence"]], numeric={2, 3, 4, 5, 6}))
     # details
     R = ctx["raw"]
     out.append("<h2>Details</h2>")
@@ -463,10 +471,11 @@ def render(ctx: dict) -> str:
         t = res["target"]
         out.append(f'<h3>{e(st["label"])} · public benchmark ({e(res["dataset"])}) '
                    f'<span class="muted small">· {e(res.get("tool", "vllm bench serve"))} · {e(t.get("gpus"))} GPU(s)</span></h3>')
+        selection = ("Highlighted row meets the throughput comparison criteria." if st["ok"]
+                     else "Highlighted row is the lowest-latency complete load." if st["op"] is not None
+                     else "No complete operating point was available.")
         out.append(f'<p class="small muted">{e(res.get("dataset_desc", ""))}. Independent requests, no shared prompt or history. '
-                   f"Highlighted row = best load that met the latency targets"
-                   f'{"" if st["ok"] else " (none did; this is the lowest-latency load)"}. '
-                   f'Hosted price: {e(st.get("api_name") or "none set")}.</p>')
+                   f'{selection} Hosted price: {e(st.get("api_name") or "none set")}.</p>')
         srows, hi = [], None
         for i, l in enumerate(res["levels"]):
             if l["concurrency"] == st["op"]:
@@ -489,7 +498,7 @@ def render(ctx: dict) -> str:
     tv = R.get("tts_vllm")
     if tv and tv.get("levels"):
         out.append('<h3>TTS · Indic-Speak speech LM on vLLM <span class="muted small">· Vocos decoder not included</span></h3>')
-        out.append(table(["Streams", "Audio s per GPU-s", "Stream speed p5 (× real time)", "Stream speed p50", "First audio p95 s",
+        out.append(table(["Streams", "Audio s per GPU-s", "Stream speed p5 (× real time)", "Stream speed p50", "28th streamed chunk p95 s",
                           "Ran to max tokens", "Errors"],
                          [[e(l["concurrency"]), num(l["audio_s_per_s"], 1), num(l["stream_speed_x_realtime"].get("p5"), 2),
                            num(l["stream_speed_x_realtime"].get("p50"), 2), num(l["first_4_frames_s"].get("p95"), 2),

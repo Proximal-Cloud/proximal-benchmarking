@@ -46,19 +46,12 @@ def first(R: Path, *names):
 
 
 def session_point(res, slo):
-    good, best = [], None
-    for lv in res["levels"]:
-        t95, p95 = lv["ttft_s"].get("p95"), lv["tpot_ms"].get("p95")
-        if lv.get("endpoint_failed") or t95 is None or p95 is None or not lv["output_tok_per_s"]:
-            continue
-        err_rate = lv["errors"] / max(1, lv["errors"] + lv["turns_completed_in_window"])
-        if t95 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"] and err_rate < 0.01:
-            good.append(lv)
-        if best is None or t95 < best["ttft_s"]["p95"]:
-            best = lv
-    if good:
-        return max(good, key=lambda x: x["output_tok_per_s"]), True
-    return best, False
+    criteria = {k: v for k, v in slo.items() if k.startswith("llm_")}
+    if res.get("run", {}).get("criteria") != criteria:
+        return None, False
+    good = [lv for lv in res["levels"] if lv.get("measurement", {}).get("status") == "qualified"
+            and lv.get("output_tok_per_s", 0) > 0]
+    return (max(good, key=lambda lv: lv["output_tok_per_s"]), True) if good else (None, False)
 
 
 def public_point(res, slo):
@@ -68,8 +61,9 @@ def public_point(res, slo):
         t95, p95 = lv["ttft_ms"].get("p95"), lv["tpot_ms"].get("p95")
         if t95 is None or p95 is None or not lv.get("output_throughput"):
             continue
-        fail = (lv.get("failed") or 0) / max(1, (lv.get("failed") or 0) + (lv.get("completed") or 0))
-        if t95 / 1000 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"] and fail < 0.01:
+        if lv.get("completed") != lv.get("num_prompts") or lv.get("failed"):
+            continue
+        if t95 / 1000 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"]:
             good.append(lv)
         if best is None or t95 < best["ttft_ms"]["p95"]:
             best = lv
@@ -134,6 +128,31 @@ def main():
 
     rows, notes, units, glance, public = [], [], [], [], []
     raw = {"sessions": []}
+    evidence = []
+    trials = {}
+    trail = R / "trials.tsv"
+    if trail.is_file():
+        for event in trail.read_text().splitlines():
+            fields = event.split("\t")
+            if len(fields) != 4:
+                continue
+            label, timestamp, phase, code = fields
+            if phase == "started":
+                trials[label] = {"started_at": int(timestamp), "exit_code": None}
+            elif phase == "finished" and label in trials:
+                trials[label].update(finished_at=int(timestamp), exit_code=int(code))
+        for label, trial in trials.items():
+            if trial["exit_code"] is None:
+                notes.append(f"{label}: started without a recorded finish.")
+            elif trial["exit_code"]:
+                notes.append(f"{label}: runner exited with code {trial['exit_code']}. See the workload log.")
+
+    def collect(result):
+        if result:
+            run = result.get("run", {})
+            for row in result.get("measurements", []):
+                evidence.append({"run_id": run["id"], "workload": run["workload"],
+                                 "target": result.get("target_name", result["bench"]), **row})
 
     def unit(line, model, unit_name, throughput, gpu_s_per_unit, market=None, note=""):
         units.append({"line": line, "model": model, "unit": unit_name, "throughput": throughput,
@@ -153,8 +172,8 @@ def main():
     # ---- 1. ASR
     asr = load(R / "asr.json")
     asr_api = day["asr_minutes"] * api["bodhan_hosted"]["asr_inr_per_audio_minute"] / fx
-    if asr and asr.get("throughput"):
-        best = max(asr["throughput"], key=lambda x: x["rtfx"])
+    best = next((l for l in (asr or {}).get("throughput", []) if l["batch_size"] == 1), None)
+    if best and best["rtfx"] > 0:
         ok = (asr["latency_batch1_s"].get("p95") or 99) <= slo["asr_latency_p95_s"]
         unit("1. ASR", "Indic-Transcribe-core", "1 minute of audio", f"RTFx {best['rtfx']:.0f} (batch {best['batch_size']})",
              60 / best["rtfx"], mref.get("asr_usd_per_min"))
@@ -171,7 +190,7 @@ def main():
     tts_v, tts_h = load(R / "tts_vllm.json"), load(R / "tts_hf.json")
     cps = (tts_h or {}).get("chars_per_audio_s") or api["tts_chars_per_audio_second"]
     tts_api = day["tts_minutes"] * 60 * cps / 10000 * api["bodhan_hosted"]["tts_inr_per_10k_chars"] / fx
-    if tts_v and tts_v.get("levels"):
+    if not tts_h and tts_v and any(l["audio_s_per_s"] > 0 for l in tts_v.get("levels", [])):
         margin = tts_v.get("realtime_margin", slo["tts_realtime_margin"])
         good = [l for l in tts_v["levels"] if (l["stream_speed_x_realtime"].get("p5") or 0) >= margin and not l["errors"]]
         pick = max(good or tts_v["levels"], key=lambda l: l["audio_s_per_s"])
@@ -180,12 +199,12 @@ def main():
         unit("2. TTS", "Indic-Speak (vLLM)", "1M characters of text", f"at {cps:.1f} characters per audio second",
              1e6 / cps / pick["audio_s_per_s"], mref.get("tts_usd_per_m_chars"))
         add("2. TTS (10 min)", "Indic-Speak (LM on vLLM)", f"{pick['concurrency']} streams",
-            f"{pick['audio_s_per_s']:.0f} s audio / GPU-s", day["tts_minutes"] * 60 / pick["audio_s_per_s"], tts_api, bool(good),
+            f"{pick['audio_s_per_s']:.0f} s audio / GPU-s", day["tts_minutes"] * 60 / pick["audio_s_per_s"], tts_api, None,
             extra={"stream_speed_p5_x": pick["stream_speed_x_realtime"].get("p5"),
                    "share_hit_max_tokens": pick.get("share_hit_max_tokens"),
                    "checks": [chk("slowest 5% of streams vs playback speed", pick["stream_speed_x_realtime"].get("p5"),
                                   margin, "× real time", "min")]})
-        notes.append("TTS (vLLM mode) excludes the Vocos decoder; compare with the single-stream run to size it.")
+        notes.append("Batched TTS is a token-rate estimate. End-to-end waveform capacity is required for the total.")
         if (pick.get("share_hit_max_tokens") or 0) > 0.5:
             notes.append("TTS WARNING: most requests hit max_tokens (wrong stop tokens?), so audio length and cost are unreliable.")
     elif tts_h:
@@ -194,8 +213,9 @@ def main():
         unit("2. TTS", "Indic-Speak (one stream)", "1M characters of text", f"at {cps:.1f} characters per audio second",
              1e6 / cps / tts_h["rtfx_single_stream"], mref.get("tts_usd_per_m_chars"))
         add("2. TTS (10 min)", "Indic-Speak (transformers)", "single stream, end to end",
-            f"RTFx {tts_h['rtfx_single_stream']:.1f}", day["tts_minutes"] * 60 / tts_h["rtfx_single_stream"], tts_api)
-        notes.append("TTS is priced from the single-stream run, an upper bound on cost; the batched vLLM run didn't produce results.")
+            f"RTFx {tts_h['rtfx_single_stream']:.1f}", day["tts_minutes"] * 60 / tts_h["rtfx_single_stream"], tts_api,
+            tts_h["rtfx_single_stream"] >= slo["tts_realtime_margin"])
+        notes.append("TTS uses the measured single-stream waveform rate. Batched token rates are listed separately.")
     else:
         add("2. TTS (10 min)", "Indic-Speak", "not run yet", "-", None, tts_api, None)
         unit("2. TTS", "Indic-Speak", "1M characters of text", "not run yet", None, mref.get("tts_usd_per_m_chars"))
@@ -203,7 +223,7 @@ def main():
     # ---- 3. OCR
     ocr = load(R / "ocr.json")
     ocr_api = day["ocr_pages"] * api["bodhan_hosted"]["ocr_inr_per_image"] / fx
-    if ocr and ocr.get("levels"):
+    if ocr and any(l["pages_per_s"] > 0 for l in ocr.get("levels", [])):
         good = [l for l in ocr["levels"] if (l["latency_s"].get("p95") or 99) <= slo["ocr_page_latency_p95_s"] and not l["errors"]]
         pick = max(good or ocr["levels"], key=lambda l: l["pages_per_s"])
         unit("3. OCR", "IndicOCR", "1,000 pages", f"{pick['pages_per_s']:.2f} pages/s ({pick['workers']} model copies)",
@@ -231,10 +251,14 @@ def main():
             api_day = (llm_day["cached_input_tokens"] * pr.get("usd_per_m_cached", pr["usd_per_m_input"])
                        + llm_day["uncached_input_tokens"] * pr["usd_per_m_input"] + out_day * pr["usd_per_m_output"]) / 1e6
         res = first(R, f"socratic_{tname}.json", f"workhorse_{tname}.json")
+        collect(res)
         lv, ok = session_point(res, slo) if res and res.get("levels") else (None, None)
         if lv is None:
-            add(line, label, "not run yet", "-", None, api_day, None, kind="llm", extra={"target": tname})
-            unit(line, label, "1M output tokens, all-in", "not run yet", None, None)
+            reason = "no qualified measurement" if res else "not run yet"
+            add(line, label, reason, "-", None, api_day, None, kind="llm", extra={"target": tname})
+            unit(line, label, "1M output tokens, all-in", reason, None, None)
+            if res and res.get("levels"):
+                raw["sessions"].append((res, None, label))
         else:
             raw["sessions"].append((res, lv["concurrency"], label))
             gpus = res["target"].get("gpus", 1)
@@ -276,13 +300,12 @@ def main():
                 notes.append(f"{label}: measured mix per student-day = {cached_day / 1e6:.2f}M cached + "
                              f"{uncached_day / 1e3:.0f}K uncached input (spec: {llm_day['cached_input_tokens'] / 1e6:.1f}M + "
                              f"{llm_day['uncached_input_tokens'] / 1e3:.0f}K); cache hit rate {(lv.get('cache_hit_rate_usage') or 0):.1%}.")
-            if not ok:
-                notes.append(f"{label}: no Socratic load level met the latency targets; priced at its lowest-latency level.")
 
         # Public benchmark for the same model (comparison only; not in the totals)
         pubs = sorted(R.glob(f"public_{tname}_*.json")) or sorted(R.glob(f"standard_{tname}_*.json"))
         for p in pubs:
             pres = load(p)
+            collect(pres)
             if not pres or not pres.get("levels"):
                 continue
             plv, pok = public_point(pres, slo)
@@ -316,15 +339,17 @@ def main():
                          tag + "; approximate split")
                     unit(line, who, "1M output tokens", f"{1 - share:.0%} of each request is writing (approx.)",
                          (1 - share) * plv["gpu_s"] * per_m, mref.get("llm_usd_per_m_output"), tag + "; approximate split")
-            if not pok:
+            if plv and not pok:
                 notes.append(f"{label}, public benchmark ({pres['dataset']}): no level met the latency targets; shown at its lowest-latency level.")
 
+    for result in (asr, tts_v, tts_h, ocr):
+        collect(result)
     # ---- totals: ASR + TTS + OCR + the cheapest LLM that ran
     speech = [r for r in rows if r["kind"] == "speech"]
     llms = [r for r in rows if r["kind"] == "llm" and r["usd_day_compute"] is not None]
     llm_pick = min(llms, key=lambda r: r["usd_day_compute"]) if llms else None
-    chosen = [r for r in speech if r["usd_day_compute"] is not None] + ([llm_pick] if llm_pick else [])
-    missing = [r["line"].split(" (")[0] for r in speech if r["usd_day_compute"] is None] + ([] if llm_pick else ["LLM"])
+    chosen = [r for r in speech if r["usd_day_compute"] is not None and r["slo_met"] is True] + ([llm_pick] if llm_pick else [])
+    missing = [r["line"].split(" (")[0] for r in speech if r not in chosen] + ([] if llm_pick else ["LLM"])
     pure_day = sum(r["usd_day_compute"] for r in chosen)
     total = pure_day / util * dpm
     if len(llms) > 1:
@@ -359,17 +384,27 @@ def main():
             lines.append(f"| {g['model']} | {g['workload']} | {g['op']}{'' if g['slo_ok'] else ' (missed latency target)'} | "
                          f"{g['out_tps']:,.0f} | {g['mean_in']:,.0f} / {g['mean_out']:,.0f} | {f(usd_m)} | {f(g['api_per_m_out'])} | {ratio} |")
         lines.append("")
+    if evidence:
+        lines += ["## Run evidence", "",
+                  "| Target / workload | Level | Issued | Completed | Unique inputs | Seconds | Joint passes/min | Status | Stop reason |",
+                  "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"]
+        for row in evidence:
+            lines.append(f"| {row['target']} / {row['workload']} | {row['name']} | {f(row['issued'], 0, '')} | "
+                         f"{f(row['completed'], 0, '')} | {f(row['unique_inputs'], 0, '')} | "
+                         f"{f(row['duration_s'], 1, '')} | {f(row.get('joint_passes_per_min'), 2, '')} | "
+                         f"{row['status']} | {row['stop_reason']} |")
+        lines.append("")
     lines += [f"- Not costed yet: {n}" for n in spec.get("not_costed_yet", [])]
     lines += [""] + [f"- {n}" for n in notes]
     raw.update({"asr": asr, "tts_vllm": tts_v, "tts_hf": tts_h, "ocr": ocr})
-    page = render({"spec": spec, "rows": rows, "notes": notes, "missing": missing, "raw": raw, "machine": machine,
+    page = render({"evidence": evidence, "spec": spec, "rows": rows, "notes": notes, "missing": missing, "raw": raw, "machine": machine,
                    "units": units, "chosen": chosen, "llm_pick": llm_pick, "pricing": pricing, "glance": glance,
                    "public": public})
     html_path = R / "report.html"
     html_path.write_text(page, encoding="utf-8")
     out = Path(a.out or R / "report.md")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (R / "report.json").write_text(json.dumps({"pricing": pricing, "lines": rows, "units": units, "llm_comparison": glance,
+    (R / "report.json").write_text(json.dumps({"trials": trials, "evidence": evidence, "pricing": pricing, "lines": rows, "units": units, "llm_comparison": glance,
                                                "total_usd_month_pure_compute": pure_day * dpm, "total_usd_month_at_util": total,
                                                "missing": missing, "notes": notes, "spec": spec}, indent=2, default=str),
                                    encoding="utf-8")
