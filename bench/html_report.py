@@ -491,9 +491,12 @@ def render(ctx: dict) -> str:
                           f'{(l.get("total_input_tokens") or 0) / n:,.0f} / {out_tok / n:,.0f}',
                           num((l["ttft_ms"].get("p50") or 0) / 1000, 2), num((l["ttft_ms"].get("p95") or 0) / 1000, 2),
                           num(l["tpot_ms"].get("p95"), 1), num(gutil, 0, suf="%"),
-                          D(gs_m), ratio(gs_m, api_m), e(l.get("failed", 0))])
+                          D(gs_m), ratio(gs_m, api_m), e(l.get("failed", 0)),
+                          e(l.get("completion_status", "—")), e(l.get("capacity_status", "—")),
+                          e(l.get("latency_status", "—")), num(l.get("joint_fraction"), 3)])
         out.append(table(["Requests at once", "Req/s", "Out tok/s", "Total tok/s", "Mean in / out tokens", "TTFT p50 s",
-                          "TTFT p95 s", "TPOT p95 ms", "GPU util", "$ per 1M output", "vs hosted", "Failed"],
+                          "TTFT p95 s", "TPOT p95 ms", "GPU util", "$ per 1M output", "vs hosted", "Failed",
+                          "Completion", "Capacity", "Joint latency", "Joint pass fraction"],
                          srows, numeric=set(range(12)), highlight=hi))
     tv = R.get("tts_vllm")
     if tv and tv.get("levels"):

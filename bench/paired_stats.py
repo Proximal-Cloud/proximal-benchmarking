@@ -24,7 +24,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--level", required=True, help="measurement name in each result JSON")
     ap.add_argument("--pair", action="append", nargs=2, required=True, metavar=("BASELINE", "CANDIDATE"))
-    ap.add_argument("--metric", choices=["completed_per_min", "joint_passes_per_min"], default="completed_per_min")
+    ap.add_argument("--metric", choices=["completed_per_min", "joint_passes_per_min", "output_tok_s", "p95_ttft_ms", "p95_e2e_ms"], default="completed_per_min")
     a = ap.parse_args()
     ids = set()
     differences = []
@@ -33,6 +33,7 @@ def main():
         rates = []
         statuses = []
         seeds = []
+        fingerprints = []
         for filename in files:
             data = json.loads(Path(filename).read_text())
             run = data.get("run", {})
@@ -42,8 +43,9 @@ def main():
             ids.add(run["id"])
             row = matches[0]
             seeds.append(data.get("seed"))
+            fingerprints.append(row.get("input_fingerprint"))
             settings = (data["bench"], run["workload"], run["criteria"], run["stop_condition"], row["unit"],
-                        data.get("request_rate"), data.get("profile"), data.get("think_time_s"), row["planned"])
+                        data.get("dataset"), data.get("dataset_sha256"), data.get("serving", {}).get("cache_state"), data.get("request_rate"), data.get("profile"), data.get("think_time_s"), row["planned"])
             if protocol is not None and settings != protocol:
                 ap.error(f"{filename}: workload or measurement settings differ across runs")
             protocol = settings
@@ -55,6 +57,8 @@ def main():
                 ap.error(f"{filename}: {a.metric} unavailable")
             rates.append(value)
             statuses.append(row["status"])
+        if fingerprints[0] != fingerprints[1]:
+            ap.error("the input fingerprints differ within a pair")
         if seeds[0] != seeds[1]:
             ap.error("the baseline and candidate must use the same seed within each pair")
         differences.append(rates[1] - rates[0])

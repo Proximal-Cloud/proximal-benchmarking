@@ -239,6 +239,66 @@ With at least six independent pairs it also gives a distribution-free 95% interv
 Six pairs can still give a wide interval.
 For a stability claim, fix the exposure in advance and keep stopped runs, elapsed time, and recovery logs alongside completed runs.
 
+### Full-context capacity and retrieval
+
+Run the client against an existing, dedicated vLLM endpoint.
+Each user receives an independent ShareGPT history with exactly the requested number of prompt and output tokens.
+The client uses the endpoint's tokenizer.
+For example, this command tests 16,384 and 32,768 tokens per user, with 512 output tokens included in each limit.
+
+```bash
+python3 bench/standard_bench.py --mode full-context --target gemma31b-w4 \
+  --base-url http://localhost:8000/v1 --dataset-path "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" \
+  --contexts 16384,32768 --output-tokens 512 --concurrency 16 \
+  --gpus 1,3 --device-pci 0000:64:00.0,0000:a6:00.0 --serving-config serving.json \
+  --wall-budget 14400 --timeout 10800 --stall-timeout 1800 --retrieval --out results/context.json
+```
+
+Set the GPU identifiers to the serving devices on your machine.
+Run the client on the serving host with access to its kernel journal, or pass an append-only copy with `--kernel-log`.
+A missing device check yields insufficient capacity evidence.
+The endpoint must expose streaming completions, token IDs, final usage, model information, health and vLLM metrics.
+The optional serving JSON records operator-supplied settings such as `{"weights":"INT4","activations":"BF16","kv_cache":"FP8 E4M3","tp":2}`.
+Include the model revision, image digest, launch arguments, KV budget and cache state when comparing deployments.
+
+The JSON, Markdown and CSV report completion, full-length concurrent capacity and joint latency separately.
+A capacity pass requires exact per-user token counts, overlapping decode for the requested users, zero preemptions and healthy serving devices and endpoint.
+The joint latency fraction uses planned requests as its denominator and the thresholds in `config/spec.yaml`.
+Retrieval adds three independent scored requests with a record near the beginning, middle or end of the prompt.
+Their latency is excluded from the capacity burst.
+
+Each trial has its own evidence directory beside the output JSON.
+Regenerate a combined table from saved runs with `python3 bench/llm_report.py --out results/llm-summary results/context.json results/public_model_sharegpt.json`.
+The native client flushes request events as it receives them.
+Use the final request states and last scheduler sample to distinguish failures, interruptions, active requests and queued requests.
+The public vLLM client retains its command, raw detailed result, logs and sampled server counters.
+If that external client stops before writing a result, its request-level counts are unknown.
+Server counters can include warmups and other traffic on a shared endpoint.
+
+Set a total wall budget and a separate stall timeout when runtime matters.
+The next-level estimate uses the last measured duration, user count and, for long prompts, the square of context length.
+Treat that estimate as a scheduling heuristic.
+A hard time limit also applies to the first level.
+Increase the stall timeout for long prefills on servers that expose counters infrequently.
+
+### Matched repetitions
+
+Use one burst for a capacity observation and repeated pairs for performance comparisons.
+For example, create `baseline.json` and `candidate.json` with deployment arguments such as `["--base-url","http://localhost:8000/v1","--serving-config","baseline-serving.json"]`.
+Start both servers before running the comparison.
+Control or record cache state between trials.
+
+```bash
+python3 bench/matched_runs.py --pairs 6 --seed 100 --baseline baseline.json --candidate candidate.json \
+  --out-dir results/comparison-01 -- --mode full-context --contexts 16384 --output-tokens 512 \
+  --concurrency 16 --target gemma31b-w4 --dataset-path "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+```
+
+Supply each deployment's device PCI addresses in its argument file for full-context qualification.
+The runner alternates deployment order, matches seeds within each pair, and writes an individual result for each burst plus a combined Markdown table and CSV.
+It finishes the current pair and stops after a failed run.
+Use the paired analysis above to calculate the median difference and its interval.
+
 ## Reading the report
 
 - **Top bar:** which machine and $/GPU-hour the numbers use. Pick another machine or type

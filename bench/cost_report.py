@@ -63,7 +63,8 @@ def public_point(res, slo):
             continue
         if lv.get("completed") != lv.get("num_prompts") or lv.get("failed"):
             continue
-        if t95 / 1000 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"]:
+        latency = lv.get("latency_status")
+        if latency == "passed" or (latency is None and t95 / 1000 <= slo["llm_ttft_p95_s"] and p95 <= slo["llm_tpot_p95_ms"]):
             good.append(lv)
         if best is None or t95 < best["ttft_ms"]["p95"]:
             best = lv

@@ -86,4 +86,53 @@ for level in socratic["levels"]:
     level["measurement"]["status"] = "failed"
 assert session_point(socratic, report["spec"]["slo"]) == (None, False)
 PYTEST
+# Exercise exact context lengths, three retrieval positions and a detached kernel log.
+python3 - "$OUT/long.json" <<'PYDATA'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps([
+    {"conversations": [{"value": f"student-{i} " + "a passage about arithmetic " * 20}]}
+    for i in range(8)
+]))
+PYDATA
+touch "$OUT/kernel.log"
+python3 bench/standard_bench.py --mode full-context --target gemma31b-w4 --contexts 256 \
+  --concurrency 2 --output-tokens 16 --dataset-path "$OUT/long.json" --base-url "http://localhost:$PORT/v1" \
+  --device-pci 0000:64:00.0 --kernel-log "$OUT/kernel.log" --retrieval --wall-budget 30 --out "$OUT/context.json"
+python3 - "$OUT" <<'PYCHECK'
+import csv, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+result = json.loads((root / "context.json").read_text())
+level = result["levels"][0]
+assert level["completion_status"] == level["capacity_status"] == level["retrieval_status"] == "passed", level
+assert level["exact_lengths"] == level["verified_decode_concurrency"] == 2
+assert level["server_limit"] == 32768 and level["total_input_tokens"] == 480
+assert level["simultaneous_decode_s"] > 0 and level["joint_passed"] == 2
+folder = Path(result["artifacts"])/"ctx256-c2"
+assert (folder/"events.jsonl").exists() and len(json.loads((folder/"retrieval.json").read_text())) == 3
+with (root/"context.csv").open() as f:
+    assert next(csv.DictReader(f))["Capacity"] == "passed"
+assert "32768" in (root/"context.md").read_text()
+PYCHECK
+# Verify that the matched runner alternates deployments and preserves input identity.
+printf '["--device-pci","0000:64:00.0","--kernel-log","%s"]\n' "$OUT/kernel.log" > "$OUT/deployment.json"
+python3 bench/matched_runs.py --baseline "$OUT/deployment.json" --candidate "$OUT/deployment.json" \
+  --pairs 2 --seed 10 --out-dir "$OUT/pairs" -- --mode full-context --target gemma31b-w4 \
+  --contexts 256 --output-tokens 16 --concurrency 2 --dataset-path "$OUT/long.json" --base-url "http://localhost:$PORT"
+python3 bench/paired_stats.py --metric output_tok_s --level 'context 256 concurrency 2' \
+  --pair "$OUT/pairs/pair1-baseline.json" "$OUT/pairs/pair1-candidate.json" \
+  --pair "$OUT/pairs/pair2-baseline.json" "$OUT/pairs/pair2-candidate.json"
+python3 bench/llm_report.py "$OUT/context.json" "$OUT/context.json" "$OUT/partial.json" --out "$OUT/summary"
+python3 - "$OUT" <<'PYPAIR'
+import csv, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+runs = json.loads((root/"pairs/manifest.json").read_text())["runs"]
+assert [(r["deployment"], r["seed"]) for r in runs] == [
+    ("baseline", 10), ("candidate", 10), ("candidate", 11), ("baseline", 11)]
+with (root/"summary.csv").open() as f:
+    rows = list(csv.DictReader(f))
+assert len(rows) == 2 and rows[1]["Completion"] == "failed"
+PYPAIR
 echo "END-TO-END TEST PASSED"
