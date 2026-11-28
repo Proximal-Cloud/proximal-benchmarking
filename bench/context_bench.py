@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 import signal
 import sys
@@ -16,6 +17,26 @@ from context_inputs import ShareGPT, fingerprint, retrieval_cases
 from device_journal import DeviceJournal
 from llm_stream import Endpoint, burst
 from llm_evidence import RunEvidence, SweepBudget, decode_peak, joint_latency, save_json, verdict
+
+
+@dataclass(frozen=True)
+class ContextLevel:
+    context_tokens: int
+    users: int
+    output_tokens: int
+
+    @property
+    def input_tokens(self) -> int:
+        return self.context_tokens - self.output_tokens
+
+    @property
+    def estimated_work(self) -> int:
+        """Relative prefill cost used only for scheduling."""
+        return self.users * self.context_tokens**2
+
+    @property
+    def measurement_name(self) -> str:
+        return f"context {self.context_tokens} concurrency {self.users}"
 
 
 def summarize_burst(requests, inputs, outputs, seconds, reason, before, after, health, slo):
@@ -73,12 +94,17 @@ def summarize_burst(requests, inputs, outputs, seconds, reason, before, after, h
 
 async def retrieval(endpoint, filler, seed, outputs, folder):
     results = []
-    async for position, code, prompt in retrieval_cases(filler, seed, endpoint.tokenize):
+    async for case in retrieval_cases(filler, seed, endpoint.tokenize):
         data = await endpoint.json(
-            "/v1/completions", dict(model=endpoint.model, prompt=prompt, temperature=0, max_tokens=outputs)
+            "/v1/completions",
+            dict(model=endpoint.model, prompt=case.prompt, temperature=0, max_tokens=outputs),
         )
         answer = data["choices"][0]["text"].strip()
-        results.append(dict(position=position, expected=code, answer=answer, passed=answer == code))
+        results.append(
+            dict(
+                position=case.position, expected=case.expected, answer=answer, passed=answer == case.expected
+            )
+        )
         save_json(folder / "retrieval.json", results)
     return verdict([r["passed"] for r in results])
 
@@ -186,15 +212,15 @@ async def measure_level(endpoint, prompts, options, folder, end, server_limit, s
     return level
 
 
-def record_level(data, context, users, level):
+def record_level(data, spec: ContextLevel, level):
     data["levels"].append(level)
     m = measurement(
-        f"context {context} concurrency {users}",
+        spec.measurement_name,
         level["issued"],
         level["completed"],
         level["duration_s"],
         checks={"capacity": {"passed": True, "failed": False}.get(level["capacity_status"])},
-        planned=users,
+        planned=spec.users,
         stop_reason=level["stop_reason"],
     )
     m.update(
@@ -225,15 +251,15 @@ async def sweep(a, target, loads, dataset, evidence, slo):
         for context, users in product(a.contexts, loads):
             if model.get("max_model_len") and context > model["max_model_len"]:
                 raise ValueError(f"requested {context} exceeds server limit {model['max_model_len']}")
-            work = users * context**2
-            if not budget.allows(work, f"Context {context}, users {users}"):
+            spec = ContextLevel(context, users, a.output_tokens)
+            if not budget.allows(spec.estimated_work, f"Context {context}, users {users}"):
                 data["measurements"].append(
                     measurement(
-                        f"context {context} concurrency {users}",
+                        spec.measurement_name,
                         0,
                         0,
                         0,
-                        planned=users,
+                        planned=spec.users,
                         checks={"capacity": None},
                         stop_reason="wall_budget",
                     )
@@ -243,14 +269,13 @@ async def sweep(a, target, loads, dataset, evidence, slo):
                 return False
             folder = root / f"ctx{context}-c{users}"
             folder.mkdir()
-            inputs = context - a.output_tokens
             started = time.monotonic()
             end = started + min(a.timeout, budget.remaining)
             prompts = await asyncio.wait_for(
-                corpus.prompts(users, inputs, endpoint.tokenize), end - time.monotonic()
+                corpus.prompts(users, spec.input_tokens, endpoint.tokenize), end - time.monotonic()
             )
             level = await measure_level(endpoint, prompts, a, folder, end, model.get("max_model_len"), slo)
-            record_level(data, context, users, level)
+            record_level(data, spec, level)
             evidence.checkpoint()
             if level["capacity_status"] != "passed":
                 return False
@@ -262,5 +287,5 @@ async def sweep(a, target, loads, dataset, evidence, slo):
                 evidence.checkpoint()
                 if level["retrieval_status"] != "passed":
                     return False
-            budget.completed(work, time.monotonic() - started)
+            budget.completed(spec.estimated_work, time.monotonic() - started)
     return True

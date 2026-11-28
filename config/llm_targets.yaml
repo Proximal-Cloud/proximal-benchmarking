@@ -43,7 +43,10 @@ profiles:
 # tool behind most published vLLM throughput numbers. Same server, short prompts.
 standard_bench:
   concurrency: [2, 4, 8, 16]              # requests in flight at once, like N students
-  prompts_per_concurrency: 25             # prompts per level = concurrency x this, clamped to [100, 1200]
+  prompts_per_concurrency: 25
+  min_prompts: 100
+  max_prompts: 1200
+  max_warmups: 16
   datasets:
     sharegpt:     # real ChatGPT conversations; vLLM keeps prompts <= 1,024 tokens and prompt+reply <= 2,048
       path: ${INPUTS}/datasets/ShareGPT_V3_unfiltered_cleaned_split.json

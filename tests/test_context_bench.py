@@ -15,12 +15,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from context_bench import summarize_burst
 from device_journal import DeviceJournal
 from llm_stream import Endpoint, burst
+from standard_bench import PublicLoadPolicy
 from llm_evidence import SweepBudget, decode_peak, public_outcomes, read_metrics
 
 SLO = {"llm_ttft_p95_s": 3, "llm_tpot_p95_ms": 100, "llm_min_joint_pass_fraction": 0.95}
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_public_load_policy_accepts_partial_config_and_preserves_defaults(self):
+        default = PublicLoadPolicy.from_config({})
+        self.assertEqual([default.prompt_count(n) for n in (2, 8, 64)], [100, 200, 1200])
+        policy = PublicLoadPolicy.from_config(
+            {"min_prompts": 5, "prompts_per_concurrency": 2, "datasets": {}}
+        )
+        self.assertEqual([policy.prompt_count(n) for n in (1, 4)], [5, 8])
+        with self.assertRaises(ValueError):
+            PublicLoadPolicy.from_config({"max_prompts": 10})
+
     def test_budget_uses_previous_level_and_remaining_wall_time(self):
         budget = SweepBudget(20, start=0)
         with patch("llm_evidence.time.monotonic", return_value=11):

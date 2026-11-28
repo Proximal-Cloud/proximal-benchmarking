@@ -1,9 +1,23 @@
 """Construct exact-length, private ShareGPT histories and deterministic retrieval probes."""
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 import hashlib
 import json
 import random
 from pathlib import Path
+
+
+Tokenize = Callable[[str], Awaitable[list[int]]]
+DISTINCT_PREFIX_TOKENS = 32
+RETRIEVAL_POSITIONS = (("beginning", 0.0), ("middle", 0.5), ("end", 1.0))
+
+
+@dataclass(frozen=True)
+class RetrievalCase:
+    position: str
+    expected: str
+    prompt: list[int]
 
 
 class ShareGPT:
@@ -13,7 +27,7 @@ class ShareGPT:
         self.conversations = json.loads(dataset)
         random.Random(seed).shuffle(self.conversations)
 
-    async def prompts(self, users, length, tokenize):
+    async def prompts(self, users: int, length: int, tokenize: Tokenize) -> list[list[int]]:
         prompts = []
         for user in range(users):
             ids = []
@@ -27,7 +41,7 @@ class ShareGPT:
             if len(ids) < length:
                 raise ValueError(f"insufficient ShareGPT tokens for user {user}: {len(ids)} < {length}")
             prompts.append(ids[:length])
-        if len({tuple(p[:32]) for p in prompts}) != users:
+        if len({tuple(p[:DISTINCT_PREFIX_TOKENS]) for p in prompts}) != users:
             raise ValueError("users share an initial token block; change the seed or input dataset")
         return prompts
 
@@ -40,13 +54,13 @@ def fingerprint(prompts):
     return digest.hexdigest()
 
 
-async def retrieval_cases(filler, seed, tokenize):
+async def retrieval_cases(filler: list[int], seed: int, tokenize: Tokenize):
     question = await tokenize("\nWhat is the inventory code in the record above? Reply with the code only.")
-    for position, fraction in (("beginning", 0), ("middle", 0.5), ("end", 1)):
+    for position, fraction in RETRIEVAL_POSITIONS:
         code = hashlib.sha256(f"{seed}:{position}".encode()).hexdigest()[:10].upper()
         record = await tokenize(f"\nInventory record: the inventory code is {code}.\n")
         room = len(filler) - len(question) - len(record)
         if room < 1:
             raise ValueError("prompt is too short for the retrieval probe")
         at = int(room * fraction)
-        yield position, code, filler[:at] + record + filler[at:room] + question
+        yield RetrievalCase(position, code, filler[:at] + record + filler[at:room] + question)
