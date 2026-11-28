@@ -15,11 +15,29 @@
 #   MAX_SEQS=N  cap on concurrent sequences (default 64; run_all.sh uses 256 for the short-request benchmark)
 #   GPU_IDS=0   put the model on other GPU(s) than its default, e.g. on a 1-GPU machine
 #   PORT_OVERRIDE=9001   serve on another port
+#   LLM_STARTUP_TIMEOUT=2700   readiness timeout in seconds
+#   LLM_ENFORCE_EAGER=1   disable torch.compile and graph capture
+#   LLM_GPU_MEMORY_UTIL=0.80   override the fraction of GPU memory vLLM may use
+#   LLM_MAX_BATCHED_TOKENS=1024   override the token budget per scheduler step
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 RUNTIME=${RUNTIME:-$(cat "$TF_HOME/.runtime" 2>/dev/null || echo venv)}
+engine=${LLM_ENGINE:-vllm}
+prefix=tf-
+startup_default=900
+case "$engine" in
+  vllm) ;;
+  llm-scaler)
+    [ "$GPU_BACKEND" = xpu ] || { echo "!! LLM Scaler requires Intel XPU" >&2; exit 1; }
+    RUNTIME=docker
+    prefix=tf-llm-scaler-
+    startup_default=2700
+    VLLM_IMAGE=${LLM_SCALER_IMAGE:-intel/llm-scaler-vllm:1.5}
+    ;;
+  *) echo "!! unknown LLM_ENGINE: $engine" >&2; exit 1 ;;
+esac
 LOGDIR="$TF_HOME/logs"; mkdir -p "$LOGDIR"
 
 stop_one() {  # $1 = tf-<name>
@@ -35,12 +53,23 @@ name=${1:?usage: serve_llm.sh <name> | stop <name|all>}
 if [ "$name" = "stop" ]; then
   which=${2:-all}
   if [ "$which" = "all" ]; then
-    if [ "$RUNTIME" = "docker" ]; then docker ps -q --filter name=tf- | xargs -r docker rm -f
+    if [ "$RUNTIME" = "docker" ]; then docker ps -a --format '{{.Names}}' | while read -r service; do
+      case "$engine:$service" in
+        vllm:tf-llm-scaler-*) ;;
+        "$engine:$prefix"*) stop_one "$service" ;;
+      esac
+    done
     else for f in "$LOGDIR"/tf-*.pid; do [ -e "$f" ] && stop_one "$(basename "$f" .pid)"; done; fi
-  else stop_one "tf-$which"; fi
+  else stop_one "$prefix$which"; fi
   exit 0
 fi
 
+service="$prefix$name"
+startup_timeout=${LLM_STARTUP_TIMEOUT:-$startup_default}
+if [[ ! "$startup_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "!! LLM_STARTUP_TIMEOUT must be a positive integer in seconds" >&2
+  exit 1
+fi
 MAXLEN=${MAXLEN:-40960}
 EXTRA=()
 case "$name" in
@@ -78,6 +107,10 @@ if [ "$name" != "indic-speak" ]; then
   EXTRA+=(--language-model-only)             # text only: skip the vision tower, more room for KV cache
 fi
 [ "${KV_FP8:-0}" = "1" ] && EXTRA+=(--kv-cache-dtype fp8)
+[ "${LLM_ENFORCE_EAGER:-0}" = "1" ] && EXTRA+=(--enforce-eager)
+if [ -n "${LLM_MAX_BATCHED_TOKENS:-}" ]; then
+  EXTRA+=(--max-num-batched-tokens "$LLM_MAX_BATCHED_TOKENS")
+fi
 tp_n=$(awk -F, '{print NF}' <<< "$GPUS")
 if [ "$tp_n" -gt 1 ] && [[ " ${EXTRA[*]-} " != *" --tensor-parallel-size "* ]]; then
   EXTRA+=(--tensor-parallel-size "$tp_n")
@@ -94,33 +127,57 @@ if [ "$GPU_BACKEND" = "xpu" ] && [ "$name" = "gemma31b-w4" ] && [ "$tp_n" -gt 1 
   echo "== XPU: $name on GPU(s) $GPUS, tensor parallel $tp_n (one 32GB card cannot hold the 40K context)"
 fi
 
+if [ "$name" = gemma31b-w4 ] && [ -n "${GEMMA_REVISION:-}" ]; then
+  EXTRA+=(--revision "$GEMMA_REVISION" --tokenizer-revision "$GEMMA_REVISION")
+fi
 ARGS=(--served-model-name "$name"
-  --max-model-len "$MAXLEN" --gpu-memory-utilization "$MEM"
+  --max-model-len "$MAXLEN" --gpu-memory-utilization "${LLM_GPU_MEMORY_UTIL:-$MEM}"
   --max-num-seqs "${MAX_SEQS:-64}"
   --enable-prefix-caching --enable-prompt-tokens-details
   "${EXTRA[@]}")
 
-stop_one "tf-$name"
-echo "== starting tf-$name ($RUNTIME, $GPU_BACKEND): $MODEL on GPU(s) $GPUS, port $PORT"
+stop_one "$service"
+if curl -sf --max-time 3 "http://localhost:$PORT/v1/models" >/dev/null; then
+  echo "!! An LLM is already serving on port $PORT. Stop it before starting $service." >&2
+  exit 1
+fi
+echo "== starting $service ($RUNTIME, $GPU_BACKEND): $MODEL on GPU(s) $GPUS, port $PORT"
+printf '   serve arguments:'
+printf ' %q' "${ARGS[@]}"
+printf '\n'
+if [ "$RUNTIME" = docker ]; then
+  docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1 || docker pull "$VLLM_IMAGE"
+  docker image inspect --format '   image: {{.Id}} {{json .RepoDigests}}' "$VLLM_IMAGE"
+else
+  [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
+  "$VENVS/vllm/bin/python" -c 'from importlib.metadata import version; print("   vLLM package:", version("vllm"))'
+fi
 if [ "$RUNTIME" = "docker" ]; then
-  if [ "$GPU_BACKEND" = "xpu" ]; then
-    docker run -d --name "tf-$name" \
+  if [ "$engine" = llm-scaler ]; then
+    docker run -d --name "$service" \
+      --device /dev/dri -v /dev/dri/by-path:/dev/dri/by-path \
+      --shm-size 32g "${CPUSET[@]}" -p "127.0.0.1:$PORT:8000" \
+      -v "$HF_HOME:/root/.cache/huggingface" -e HF_HOME=/root/.cache/huggingface \
+      -e HF_HUB_OFFLINE=1 -e ZE_AFFINITY_MASK="$GPUS" \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn --entrypoint vllm "$VLLM_IMAGE" \
+      serve "$MODEL" --host 0.0.0.0 --port 8000 "${ARGS[@]}" >/dev/null
+  elif [ "$GPU_BACKEND" = "xpu" ]; then
+    docker run -d --name "$service" \
       --device /dev/dri -v /dev/dri/by-path:/dev/dri/by-path \
       --ipc=host --shm-size 16g \
       "${CPUSET[@]}" -p "$PORT:8000" \
       -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e ZE_AFFINITY_MASK="$GPUS" \
       "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
   else
-    docker run -d --name "tf-$name" \
+    docker run -d --name "$service" \
       --gpus "\"device=$GPUS\"" --ipc=host --shm-size 16g \
       "${CPUSET[@]}" -p "$PORT:8000" \
       -v "$HF_HOME:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
       "$VLLM_IMAGE" --model "$MODEL" "${ARGS[@]}" >/dev/null
   fi
-  alive() { docker ps -q --filter "name=tf-$name" | grep -q .; }
-  logs()  { docker logs --tail 60 "tf-$name"; }
+  alive() { [ "$(docker inspect -f '{{.State.Running}}' "$service" 2>/dev/null)" = true ]; }
+  logs()  { docker logs --tail 60 "$service"; }
 else
-  [ -x "$VENVS/vllm/bin/vllm" ] || { echo "!! $VENVS/vllm missing: run scripts/00_prep_machine.sh"; exit 1; }
   if [ "$GPU_BACKEND" = "xpu" ] && ! command -v ocloc >/dev/null 2>&1; then
     echo "!! ocloc is not on PATH. Triton cannot compile XPU kernels."
     echo "   Install it, then re-run: sudo apt-get install -y intel-ocloc"
@@ -132,17 +189,20 @@ else
   export "${GPU_VISIBLE_ENV}=$GPUS" HF_HUB_OFFLINE=1
   setsid nohup "${PIN[@]}" \
     "$VENVS/vllm/bin/vllm" serve "$MODEL" --host 127.0.0.1 --port "$PORT" "${ARGS[@]}" \
-    > "$LOGDIR/tf-$name.log" 2>&1 < /dev/null &
-  echo $! > "$LOGDIR/tf-$name.pid"
-  alive() { kill -0 "$(cat "$LOGDIR/tf-$name.pid")" 2>/dev/null; }
-  logs()  { tail -n 60 "$LOGDIR/tf-$name.log"; }
-  echo "   log: $LOGDIR/tf-$name.log"
+    > "$LOGDIR/$service.log" 2>&1 < /dev/null &
+  echo $! > "$LOGDIR/$service.pid"
+  alive() { kill -0 "$(cat "$LOGDIR/$service.pid")" 2>/dev/null; }
+  logs()  { tail -n 60 "$LOGDIR/$service.log"; }
+  echo "   log: $LOGDIR/$service.log"
 fi
 
-echo -n "== waiting for http://localhost:$PORT (model load takes 2-10 min) "
-for i in $(seq 1 180); do
-  if curl -sf "http://localhost:$PORT/v1/models" >/dev/null; then echo " ready"; exit 0; fi
+echo -n "== waiting up to ${startup_timeout}s for http://localhost:$PORT "
+deadline=$((SECONDS + startup_timeout))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if curl -sf --max-time 3 "http://localhost:$PORT/v1/models" >/dev/null; then echo " ready"; exit 0; fi
   if ! alive; then echo; echo "!! server exited. Last log lines:"; logs; exit 1; fi
-  echo -n "."; sleep 5
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || break
+  echo -n "."; sleep "$((remaining < 5 ? remaining : 5))"
 done
-echo; echo "!! not ready after 15 min. Last log lines:"; logs; exit 1
+echo; echo "!! not ready after ${startup_timeout}s. Last log lines:"; logs; exit 1

@@ -185,7 +185,9 @@ The run goes in this order, and each benchmark's log goes in the run's folder as
 | 6 | TTS, batched on vLLM | 1–64 streams | ~20 min |
 | 7 | Cost report | | seconds |
 
-A failed benchmark doesn't stop the run; the report marks that line "not run yet".
+A failed benchmark leaves the other workloads available for reporting.
+Check its recorded outcomes and the runner log.
+The sweep writes trial starts, finishes, and exit codes to `trials.tsv`, including ASR fallback attempts.
 
 ### 12. Get the report
 
@@ -199,6 +201,103 @@ scp '<user>@<server>:<path to proximal-benchmarking>/results/report_<machine>-*.
 Open it in a browser. All raw results and logs are in `results/<machine>-<date-time>/`.
 
 ---
+
+## Comparing benchmark runs
+
+Choose the workload, target, load levels, and stop condition before collecting results.
+Use a fresh output directory per trial and record the model and tokenizer revisions, engine image, physical devices, and any shared workloads.
+Start each engine afresh, replay the same inputs and seed within each pair, and alternate which engine runs first.
+
+The public LLM test saturates each concurrency level by default.
+Set `PUBLIC_REQUEST_RATE=5` with `scripts/run_all.sh` or pass `--request-rate 5` to `bench/standard_bench.py` to offer five requests per second with the same concurrency cap.
+Repeat at increasing rates to find where latency increases or completions fall behind.
+The tutoring test models users who wait for each reply before issuing the next turn.
+
+The **Run evidence** table gives the counts, duration, stop reason, and observed status for each measured cohort.
+Qualification applies to the recorded criteria and observation window.
+For tutoring, at least 95% of issued turns must meet both latency targets and fewer than 1% may fail.
+Drained requests belong to the window in which they started.
+The result JSON retains their session, attempt, timestamps, outcome, and token counts.
+Older tutoring files remain available in the detailed report and need a new run to qualify for cost totals.
+
+For ASR, read WER and CER alongside the language counts and unique source clips.
+For OCR, the recorded check covers processing latency. Text accuracy needs reference pages.
+For TTS, the HF runner measures generated waveforms. The batched runner estimates audio length from tokens.
+Use the same held-out quality set when comparing models or quantization settings.
+
+Compare independent pairs at one load level with the following command.
+Repeat `--pair` for each pair, keeping the baseline first even when it ran second.
+
+```bash
+python3 bench/paired_stats.py --level 'concurrency 2' --metric joint_passes_per_min \
+  --pair results/a1/socratic_model.json results/b1/socratic_model.json \
+  --pair results/a2/socratic_model.json results/b2/socratic_model.json
+```
+
+The comparison prints every pair and the median within-pair difference.
+With at least six independent pairs it also gives a distribution-free 95% interval for the median difference.
+Six pairs can still give a wide interval.
+For a stability claim, fix the exposure in advance and keep stopped runs, elapsed time, and recovery logs alongside completed runs.
+
+### Full-context capacity and retrieval
+
+Run the client against an existing, dedicated vLLM endpoint.
+Each user receives an independent ShareGPT history with exactly the requested number of prompt and output tokens.
+The client uses the endpoint's tokenizer.
+For example, this command tests 16,384 and 32,768 tokens per user, with 512 output tokens included in each limit.
+
+```bash
+python3 bench/standard_bench.py --mode full-context --target gemma31b-w4 \
+  --base-url http://localhost:8000/v1 --dataset-path "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json" \
+  --contexts 16384,32768 --output-tokens 512 --concurrency 16 \
+  --gpus 1,3 --device-pci 0000:64:00.0,0000:a6:00.0 --serving-config serving.json \
+  --wall-budget 14400 --timeout 10800 --stall-timeout 1800 --retrieval --out results/context.json
+```
+
+Set the GPU identifiers to the serving devices on your machine.
+Run the client on the serving host with access to its kernel journal, or pass an append-only copy with `--kernel-log`.
+A missing device check yields insufficient capacity evidence.
+The endpoint must expose streaming completions, token IDs, final usage, model information, health and vLLM metrics.
+The optional serving JSON records operator-supplied settings such as `{"weights":"INT4","activations":"BF16","kv_cache":"FP8 E4M3","tp":2}`.
+Include the model revision, image digest, launch arguments, KV budget and cache state when comparing deployments.
+
+The JSON, Markdown and CSV report completion, full-length concurrent capacity and joint latency separately.
+A capacity pass requires exact per-user token counts, overlapping decode for the requested users, zero preemptions and healthy serving devices and endpoint.
+The joint latency fraction uses planned requests as its denominator and the thresholds in `config/spec.yaml`.
+Retrieval adds three independent scored requests with a record near the beginning, middle or end of the prompt.
+Their latency is excluded from the capacity burst.
+
+Each trial has its own evidence directory beside the output JSON.
+Regenerate a combined table from saved runs with `python3 bench/llm_report.py --out results/llm-summary results/context.json results/public_model_sharegpt.json`.
+The native client flushes request events as it receives them.
+Use the final request states and last scheduler sample to distinguish failures, interruptions, active requests and queued requests.
+The public vLLM client retains its command, raw detailed result, logs and sampled server counters.
+If that external client stops before writing a result, its request-level counts are unknown.
+Server counters can include warmups and other traffic on a shared endpoint.
+
+Set a total wall budget and a separate stall timeout when runtime matters.
+The next-level estimate uses the last measured duration, user count and, for long prompts, the square of context length.
+Treat that estimate as a scheduling heuristic.
+A hard time limit also applies to the first level.
+Increase the stall timeout for long prefills on servers that expose counters infrequently.
+
+### Matched repetitions
+
+Use one burst for a capacity observation and repeated pairs for performance comparisons.
+For example, create `baseline.json` and `candidate.json` with deployment arguments such as `["--base-url","http://localhost:8000/v1","--serving-config","baseline-serving.json"]`.
+Start both servers before running the comparison.
+Control or record cache state between trials.
+
+```bash
+python3 bench/matched_runs.py --pairs 6 --seed 100 --baseline baseline.json --candidate candidate.json \
+  --out-dir results/comparison-01 -- --mode full-context --contexts 16384 --output-tokens 512 \
+  --concurrency 16 --target gemma31b-w4 --dataset-path "$INPUTS/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+```
+
+Supply each deployment's device PCI addresses in its argument file for full-context qualification.
+The runner alternates deployment order, matches seeds within each pair, and writes an individual result for each burst plus a combined Markdown table and CSV.
+It finishes the current pair and stops after a failed run.
+Use the paired analysis above to calculate the median difference and its interval.
 
 ## Reading the report
 
@@ -287,3 +386,95 @@ It becomes its own numbered line in the report (5. …). The total uses the chea
 | `tests/` | end-to-end test against a mock server, no GPU needed: `bash tests/test_end_to_end.sh` |
 
 Benchmark results, logs and downloaded data stay out of git (see `.gitignore`).
+
+## Compare LLM Scaler with upstream vLLM on Intel
+
+Use the same two Arc Pro B70s for both servers.
+LLM Scaler uses Docker and defaults to `intel/llm-scaler-vllm:1.5`.
+Upstream vLLM uses the existing runtime.
+Both runs use the cached Gemma 4 31B QAT checkpoint, 40,960 context tokens, and prefix caching.
+Intel documents online FP8 and symmetric INT4 for Gemma 4 31B.
+Confirm that the exact QAT checkpoint works in the smoke test before running the comparison.
+[Intel LLM Scaler release notes](https://github.com/intel/llm-scaler/releases/tag/vllm-1.5)
+
+Pull this benchmarking branch on the Intel host and run these commands from its checkout.
+Use the same upstream XPU environment as the earlier benchmark.
+If the environment or model cache needs setup, run `scripts/00_prep_machine.sh` and `scripts/01_download_models.sh` first.
+
+```bash
+source scripts/env.sh
+export MACHINE=intel MODELS=gemma31b-w4 LLM_GPU=0,1
+export SKIP_BODHAN=1 SKIP_TTS_VLLM=1 MAXLEN=40960 KV_FP8=0
+export VLLM_BENCH_CMD="$VENVS/vllm/bin/vllm"
+ls "$HF_HOME/hub/models--google--gemma-4-31B-it-qat-w4a16-ct/snapshots"
+export GEMMA_REVISION='cached-snapshot-commit'
+docker pull intel/llm-scaler-vllm:1.5
+export LLM_SCALER_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' intel/llm-scaler-vllm:1.5)"
+```
+
+Replace `cached-snapshot-commit` with the snapshot used for both runs.
+Confirm both GPUs are idle and port 8001 is free before starting.
+The first LLM Scaler start can spend more than 15 minutes compiling and warming up XPU kernels.
+The launcher waits up to 45 minutes for LLM Scaler and 15 minutes for upstream vLLM.
+Set `LLM_STARTUP_TIMEOUT` in seconds to override either limit.
+If XPU compilation exhausts host RAM and the system starts swapping, retry with `LLM_ENFORCE_EAGER=1`.
+If eager startup runs out of GPU memory while allocating KV cache, set `LLM_GPU_MEMORY_UTIL=0.80` to leave more GPU memory free.
+Use the same eager and GPU memory settings for both engines when measuring a matched comparison.
+
+```bash
+for engine in vllm llm-scaler; do
+  if LLM_ENGINE="$engine" GPU_IDS="$LLM_GPU" scripts/serve_llm.sh gemma31b-w4 &&
+     scripts/smoke_llm.sh gemma31b-w4 8001; then
+    LLM_ENGINE="$engine" scripts/serve_llm.sh stop gemma31b-w4
+  else
+    echo "Smoke test failed for $engine"
+    break
+  fi
+done
+```
+
+If LLM Scaler cannot serve the exact checkpoint at full context, keep its startup logs.
+Use the same alternative checkpoint and precision on both stacks for a matched rerun.
+Comparisons with different quantization settings describe the deployed stacks.
+
+After both smoke tests pass, run the paired benchmark with four concurrent Socratic students and sixteen concurrent ShareGPT requests.
+Use the standard measurement duration and prompt count.
+For repeated pairs, alternate engine order.
+
+```bash
+export QUICK=0 SOCRATIC_CONCURRENCY=4 PUBLIC_CONCURRENCY=16
+LLM_ENGINE=vllm scripts/run_all.sh &&
+LLM_ENGINE=llm-scaler scripts/run_all.sh
+```
+
+Pass the printed result directories to the comparison script in run order.
+
+```bash
+"$VENVS/bench/bin/python" bench/compare_llm.py "results/VLLM-RUN" "results/LLM-SCALER-RUN"
+```
+
+The comparison shows throughput, p95 latency, errors, and available cache metrics at each level.
+It marks missing levels and shows the Socratic operating point and GPU-seconds per student-day for each repeat.
+The `serve_*.log` files record launch arguments and the engine package or image ID.
+Keep these logs and the raw results with the report.
+
+### Profile a separate run with Intel APS
+
+Run the timed comparison first.
+Then collect APS profiles in a separate pass with the same engine settings and concurrency.
+APS launched this way profiles the host-side runner and its child processes.
+Docker starts the LLM Scaler workers outside that process tree.
+Use the benchmark's XPU telemetry for GPU measurements or attach VTune to the workers for server-side profiling.
+
+```bash
+source /opt/intel/oneapi/vtune/latest/apsvars.sh
+mkdir -p results/profiles
+engine=llm-scaler
+aps -r="results/profiles/aps-${engine}-$(date +%Y%m%d-%H%M%S)" \
+  env QUICK=0 LLM_ENGINE="$engine" SOCRATIC_CONCURRENCY=4 PUBLIC_CONCURRENCY=16 \
+  bash scripts/run_all.sh
+```
+
+Repeat with `engine=vllm` to profile the upstream run.
+Keep the APS report with its corresponding benchmark logs.
+[Intel APS guide](https://www.intel.com/content/www/us/en/docs/vtune-profiler/get-started-application-snapshot/2024-1/overview.html)

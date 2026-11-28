@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import GpuSampler, summarize, write_result, resolve_model_dir  # noqa: E402
+from common import GpuSampler, measurement, run_record, load_yaml, summarize, write_result, resolve_model_dir  # noqa: E402
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 
@@ -90,6 +90,10 @@ def main():
     ap.add_argument("--out", default="results/ocr.json")
     a = ap.parse_args()
 
+    limit = load_yaml("spec.yaml")["slo"]["ocr_page_latency_p95_s"]
+    run = run_record("OCR page latency", {"latency_p95_s_max": limit, "all_pages_complete": True},
+                     {"workers": a.workers, "pages_per_worker": a.pages_per_worker})
+    measurements = []
     pages = sorted(str(p) for p in Path(a.pages_dir).iterdir() if p.suffix.lower() in IMG_EXT)
     if not pages:
         sys.exit(f"no images in {a.pages_dir}")
@@ -111,12 +115,17 @@ def main():
                   "errors": len(recs) - len(ok),
                   "error_samples": list({r.get("error") for r in recs if not r["ok"]})[:3],
                   "gpu": gpu.window(t0, t1)}
+            p95 = lv["latency_s"].get("p95")
+            measurements.append(measurement(f"{w} workers", len(recs), len(ok), lv["wall_s"],
+                                            planned=w * a.pages_per_worker, unique_inputs=min(len(pages), len(recs)),
+                                            unit="pages", checks={"all_pages_complete": len(ok) == len(recs),
+                                            "latency": p95 <= limit if ok else None}, stop_reason="page_limit"))
             levels.append(lv)
             print(f"[workers {w}] {lv['pages_per_s']:.2f} pages/s | latency p50 {lv['latency_s'].get('p50', 0):.2f}s "
                   f"p95 {lv['latency_s'].get('p95', 0):.2f}s | errors {lv['errors']}")
     finally:
         gpu.stop()
-    write_result(a.out, {"bench": "ocr", "repo": repo, "parser_kwargs": kwargs, "n_inputs": len(pages), "levels": levels})
+    write_result(a.out, {"bench": "ocr", "run": run, "measurements": measurements, "repo": repo, "parser_kwargs": kwargs, "n_inputs": len(pages), "levels": levels})
 
 
 if __name__ == "__main__":

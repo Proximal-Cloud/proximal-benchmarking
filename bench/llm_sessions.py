@@ -34,7 +34,7 @@ from pathlib import Path
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import GpuSampler, load_yaml, summarize, write_result  # noqa: E402
+from common import GpuSampler, measurement, run_record, load_yaml, summarize, write_result  # noqa: E402
 
 # Ordinary classroom vocabulary, so the tokenizer sees realistic English text.
 WORDS = """
@@ -197,6 +197,7 @@ async def one_turn(http, target, headers, messages, out_tokens, force_len, extra
     body.update(extra_body or {})
     rec = {"t_start": time.time(), "ok": False}
     t0 = time.perf_counter()
+    done = False
     ttft, pieces, usage, err = None, [], None, None
     try:
         async with http.post(target["base_url"].rstrip("/") + "/chat/completions", json=body,
@@ -210,6 +211,7 @@ async def one_turn(http, target, headers, messages, out_tokens, force_len, extra
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        done = True
                         break
                     try:
                         obj = json.loads(data)
@@ -225,6 +227,8 @@ async def one_turn(http, target, headers, messages, out_tokens, force_len, extra
                             ttft = time.perf_counter() - t0
                         if c:
                             pieces.append(c)
+    except asyncio.TimeoutError:
+        err = "request_timeout"
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     e2e = time.perf_counter() - t0
@@ -236,7 +240,9 @@ async def one_turn(http, target, headers, messages, out_tokens, force_len, extra
             "completion_tokens": usage.get("completion_tokens"),
             "cached_tokens": details.get("cached_tokens"),
         })
-    if err is None and ttft is not None:
+    if not done and err is None:
+        rec["error"] = "incomplete stream"
+    if done and err is None and ttft is not None:
         rec["ok"] = True
         n = rec.get("completion_tokens") or 0
         rec["tpot_ms"] = (e2e - ttft) / (n - 1) * 1000 if n > 1 else None
@@ -252,7 +258,7 @@ def overlap(a0, a1, b0, b1):
 
 async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf,
                     system_text, system_tokens, force_len, extra_body, gpu, seed, grace_s,
-                    warmup_turns=2):
+                    slo, warmup_turns=2):
     """Run one load level and measure it in steady state.
 
     The measured window starts only after every student has finished
@@ -272,6 +278,8 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
                             random.Random(rng.random()), preseed=True) for i in range(concurrency)]
         records: list[dict] = []
         turns_done = [0] * concurrency
+        failure_streaks = [0] * concurrency
+        endpoint_failed = asyncio.Event()
         stop = asyncio.Event()
         st = {"t_warm": None, "t_stop": None, "warm_turns_reached": False}
 
@@ -284,15 +292,34 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
             await asyncio.gather(*[prime(s) for s in sessions])
 
         async def worker(i: int, s: Session):
+            attempt = 0
             while not stop.is_set():
+                attempt += 1
                 msgs, compacted = s.next_messages()
-                rec = await one_turn(http, target, headers, msgs, prof["turn_output_tokens"], force_len, extra_body)
+                start = time.time()
+                try:
+                    rec = await one_turn(http, target, headers, msgs, prof["turn_output_tokens"], force_len, extra_body)
+                except asyncio.CancelledError:
+                    records.append({"session": s.sid, "attempt": attempt, "ok": False, "error": "drain_timeout",
+                                    "t_start": start, "t_end": time.time()})
+                    raise
+                rec.update(session=s.sid, attempt=attempt)
                 rec["compacted"] = compacted
-                s.record_reply(rec.pop("reply", ""), rec.get("prompt_tokens"), rec.get("completion_tokens"))
+                reply = rec.pop("reply", "")
                 records.append(rec)
+                if not rec["ok"]:
+                    failure_streaks[i] += 1
+                    if min(failure_streaks) >= 3:
+                        endpoint_failed.set()
+                        stop.set()
+                        break
+                    await asyncio.sleep(1)
+                    continue
+                failure_streaks[i] = 0
+                s.record_reply(reply, rec.get("prompt_tokens"), rec.get("completion_tokens"))
                 turns_done[i] += 1
                 if think_s > 0 and not stop.is_set():
-                    await asyncio.sleep(random.expovariate(1.0 / think_s))
+                    await asyncio.sleep(s.rng.expovariate(1.0 / think_s))
 
         gauges: list[dict] = []
 
@@ -306,26 +333,43 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
         gtask = asyncio.create_task(gauge_loop())
         # 2) warm-up: wait until every student has done `warmup_turns` turns
         t_begin = time.time()
-        while min(turns_done) < warmup_turns and time.time() - t_begin < warmup_s:
+        while not endpoint_failed.is_set() and min(turns_done) < warmup_turns and time.time() - t_begin < warmup_s:
             await asyncio.sleep(0.5)
         st["warm_turns_reached"] = min(turns_done) >= warmup_turns
-        t_warm = st["t_warm"] = time.time()
         m0 = await scrape_metrics(http, target)
+        t_warm = st["t_warm"] = time.time()
         # 3) measure
-        await asyncio.sleep(duration_s)
+        try:
+            await asyncio.wait_for(endpoint_failed.wait(), timeout=duration_s)
+        except asyncio.TimeoutError:
+            pass
         t_stop = time.time()
-        m1 = await scrape_metrics(http, target)
         stop.set()
+        snapshot = asyncio.create_task(scrape_metrics(http, target))
         done, pending = await asyncio.wait(tasks, timeout=grace_s)
         for t in pending:
             t.cancel()
         gtask.cancel()
+        await asyncio.gather(*tasks, gtask, return_exceptions=True)
+        m1 = await snapshot
         warmup_used = t_warm - t_begin
 
     # ---- aggregate the measurement window [t_warm, t_stop]
-    W = t_stop - t_warm
+    W = max(1e-9, t_stop - t_warm)
     ok = [r for r in records if r["ok"]]
-    in_win = [r for r in ok if r["t_start"] >= t_warm and r["t_end"] <= t_stop + grace_s]
+    cohort = [r for r in records if t_warm <= r["t_start"] < t_stop]
+    in_win = [r for r in cohort if r["ok"]]
+    passed = [r for r in in_win if r["ttft_s"] <= slo["llm_ttft_p95_s"]
+              and r.get("tpot_ms") is not None and r["tpot_ms"] <= slo["llm_tpot_p95_ms"]]
+    errors = len(cohort) - len(in_win)
+    checks = {"endpoint_available": not endpoint_failed.is_set(),
+              "warmup_completed": True if st["warm_turns_reached"] else None,
+              "joint_latency": len(passed) / len(cohort) >= slo["llm_min_joint_pass_fraction"] if cohort else None,
+              "error_fraction": errors / len(cohort) < slo["llm_max_error_fraction_exclusive"] if cohort else None}
+    evidence = measurement(f"concurrency {concurrency}", len(cohort), len(in_win), W, checks=checks,
+                           stop_reason="endpoint_failed" if endpoint_failed.is_set() else "duration_elapsed")
+    evidence["joint_passed"] = len(passed)
+    evidence["joint_passes_per_min"] = 60 * len(passed) / W
     out_tok = prompt_tok = uncached_tok = turns = 0.0
     for r in ok:
         dec0 = r["t_start"] + (r["ttft_s"] or 0)
@@ -342,11 +386,23 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
 
     q_d = (pick(m1, "prefix_cache_queries") or 0) - (pick(m0, "prefix_cache_queries") or 0)
     h_d = (pick(m1, "prefix_cache_hits") or 0) - (pick(m0, "prefix_cache_hits") or 0)
-    pre_d = (pick(m1, "num_preemptions") or 0) - (pick(m0, "num_preemptions") or 0)
+    pre_start = pick(m0, "num_preemptions")
+    pre_end = pick(m1, "num_preemptions")
     kv_vals = [v for g in gauges for v in [pick(g, "kv_cache_usage") or pick(g, "cache_usage_perc")] if v is not None]
     waiting = [pick(g, "num_requests_waiting") for g in gauges if pick(g, "num_requests_waiting") is not None]
 
+    requests = []
+    for r in cohort:
+        row = {k: r[k] for k in ("session", "attempt", "t_start", "t_end", "ttft_s", "tpot_ms",
+                                 "prompt_tokens", "completion_tokens") if k in r}
+        row["outcome"] = "completed" if r["ok"] else {
+            "request_timeout": "timeout", "drain_timeout": "cancelled",
+        }.get(r["error"], "failed")
+        requests.append(row)
+
     level = {
+        "measurement": evidence,
+        "requests": requests,
         "concurrency": concurrency,
         "window_s": W,
         "warmup_s_used": warmup_used,
@@ -369,10 +425,11 @@ async def run_level(target, prof, concurrency, warmup_s, duration_s, think_s, tf
         },
         "cache_hit_rate_usage": (sum_cached / sum_prompt) if (have_cached and sum_prompt) else None,
         "cache_hit_rate_metrics": (h_d / q_d) if q_d else None,
-        "preemptions": pre_d if m1 else None,
+        "preemptions": pre_end - pre_start if pre_end is not None and pre_start is not None else None,
         "kv_cache_usage_max": max(kv_vals) if kv_vals else None,
         "requests_waiting_max": max(waiting) if waiting else None,
-        "errors": sum(1 for r in records if not r["ok"]),
+        "endpoint_failed": endpoint_failed.is_set(),
+        "errors": errors,
         "error_samples": list({r["error"] for r in records if r["error"]})[:3],
         "gpu": gpu.window(t_warm, t_stop) if gpu else None,
     }
@@ -386,6 +443,10 @@ def fmt(x, nd=2):
 async def main_async(a):
     targets = load_yaml("llm_targets.yaml")
     spec = load_yaml("spec.yaml")
+    slo = spec["slo"]
+    run = run_record(a.profile, {k: v for k, v in slo.items() if k.startswith("llm_")},
+                     {"concurrency": a.concurrency, "duration_s": a.duration, "warmup_cap_s": a.warmup,
+                      "warmup_turns": a.warmup_turns, "grace_s": a.grace, "stop_on_slo": a.stop_on_slo})
     target = targets["models"][a.target]
     prof = dict(targets["profiles"][a.profile])
     for k in ("system_prompt_tokens", "turn_new_input_tokens", "turn_output_tokens", "compact_at_tokens"):
@@ -416,13 +477,13 @@ async def main_async(a):
 
     gpu = GpuSampler(a.gpus.split(",") if a.gpus else None).start()
     levels = []
-    slo = spec["slo"]
+    concurrencies = [int(value) for value in a.concurrency.split(",")]
     try:
-        for c in [int(x) for x in a.concurrency.split(",")]:
+        for c in concurrencies:
             print(f"\n=== {a.profile}:{a.target}  concurrency={c}  warmup={a.warmup}s  window={a.duration}s ===")
             lv = await run_level(target, prof, c, a.warmup, a.duration, a.think_time, tf, system_text,
                                  prof["system_prompt_tokens"], force_len, extra_body, gpu, a.seed + c, a.grace,
-                                 warmup_turns=a.warmup_turns)
+                                 slo=slo, warmup_turns=a.warmup_turns)
             levels.append(lv)
             print(f"  warm-up {lv['warmup_s_used']:.0f}s ({'ok' if lv['warmup_turns_reached'] else 'CAPPED before every student finished its warm-up turns'}), "
                   f"{lv['turns_per_student_in_window']:.1f} measured turns per student")
@@ -436,19 +497,26 @@ async def main_async(a):
             if a.stop_on_slo and t95 and p95 and (t95 > 3 * slo["llm_ttft_p95_s"] or p95 > 3 * slo["llm_tpot_p95_ms"]):
                 print("  latency is >3x the SLO; stopping the sweep (higher load only gets worse).")
                 break
-            if lv["errors"] and lv["turns_completed_in_window"] == 0:
-                print("  every request failed; stopping. First errors:", lv["error_samples"])
+            if lv["endpoint_failed"] or (lv["errors"] and lv["turns_completed_in_window"] == 0):
+                print("  endpoint failed or no turn completed; stopping. First errors:", lv["error_samples"])
                 break
     finally:
         gpu.stop()
 
     out = a.out or f"results/{a.profile}_{a.target}.json"
     write_result(out, {
-        "bench": "llm_sessions", "profile": a.profile, "target_name": a.target,
+        "bench": "llm_sessions", "run": run, "seed": a.seed, "profile_name": a.profile, "target_name": a.target,
         "target": {k: v for k, v in target.items() if k != "api_key_env"},
         "profile": prof, "tokens_per_word": tpw, "force_output_length": force_len,
         "think_time_s": a.think_time, "levels": levels,
+        "measurements": [lv["measurement"] for lv in levels],
     })
+    failed_endpoint = any(level["endpoint_failed"] for level in levels)
+    incomplete = len(levels) != len(concurrencies) or any(
+        level["errors"] and not level["turns_completed_in_window"] for level in levels
+    )
+    if failed_endpoint or not any(lv["turns_completed_in_window"] for lv in levels) or (not a.stop_on_slo and incomplete):
+        raise SystemExit("Socratic sweep did not complete successfully")
 
 
 def main():

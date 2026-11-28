@@ -46,6 +46,8 @@ gpu:
 # Latency targets used to pick each model's operating point (the highest load that
 # still meets these). Loosen or tighten to see the cost/latency trade-off.
 slo:
+  llm_min_joint_pass_fraction: 0.95
+  llm_max_error_fraction_exclusive: 0.01
   llm_ttft_p95_s: 3.0        # time to first token
   llm_tpot_p95_ms: 60        # time per output token (~16 tok/s per student, faster than reading)
   tts_realtime_margin: 1.2   # each stream must generate audio >= 1.2x faster than playback

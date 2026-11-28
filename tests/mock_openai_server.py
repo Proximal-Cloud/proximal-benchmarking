@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import time
+import re
 
 from aiohttp import web
 
@@ -72,13 +73,19 @@ async def chat(request):
 
 async def completions(request):
     body = await request.json()
-    prompt = ntok(body.get("prompt", ""))
+    if not body.get("stream"):
+        ids = body.get("prompt")
+        text = "".join(chr(i) for i in ids) if isinstance(ids, list) else ""
+        code = re.search(r"inventory code is ([0-9A-F]+)", text)
+        return web.json_response({"choices": [{"text": code[1] if code else "two"}]})
+    content = body.get("prompt", "")
+    prompt = len(content) if isinstance(content, list) else ntok(content)
     state["prompt"] += prompt
     n_out = body.get("max_tokens", 16)
     resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
     await resp.prepare(request)
     await asyncio.sleep(prompt / PREFILL_TOK_S + 0.01)
-    await stream_tokens(resp, n_out, lambda i: {"choices": [{"index": 0, "text": "<custom_token_5>"}]})
+    await stream_tokens(resp, n_out, lambda i: {"choices": [{"index": 0, "text": "<custom_token_5>", "token_ids": [5]}]})
     usage = {"prompt_tokens": prompt, "completion_tokens": n_out}
     await resp.write(("data: " + json.dumps({"choices": [], "usage": usage}) + "\n\n").encode())
     await resp.write(b"data: [DONE]\n\n")
@@ -87,25 +94,26 @@ async def completions(request):
 
 async def tokenize(request):
     body = await request.json()
-    return web.json_response({"count": ntok(body.get("prompt", "")), "max_model_len": 32768})
+    text = body.get("prompt", "")
+    return web.json_response({"count": ntok(text), "tokens": list(map(ord, text)), "max_model_len": 32768})
 
 
 async def metrics(request):
     lines = [
-        f'vllm:prefix_cache_queries_total{{model_name="m"}} {state["q"]}',
-        f'vllm:prefix_cache_hits_total{{model_name="m"}} {state["h"]}',
-        f'vllm:num_preemptions_total{{model_name="m"}} 0',
-        f'vllm:prompt_tokens_total{{model_name="m"}} {state["prompt"]}',
-        f'vllm:generation_tokens_total{{model_name="m"}} {state["gen"]}',
-        f'vllm:kv_cache_usage_perc{{model_name="m"}} {min(1.0, 0.05 * state["running"])}',
-        f'vllm:num_requests_running{{model_name="m"}} {state["running"]}',
-        f'vllm:num_requests_waiting{{model_name="m"}} 0',
+        f'vllm:prefix_cache_queries_total{{model_name="gemma31b-w4"}} {state["q"]}',
+        f'vllm:prefix_cache_hits_total{{model_name="gemma31b-w4"}} {state["h"]}',
+        f'vllm:num_preemptions_total{{model_name="gemma31b-w4"}} 0',
+        f'vllm:prompt_tokens_total{{model_name="gemma31b-w4"}} {state["prompt"]}',
+        f'vllm:generation_tokens_total{{model_name="gemma31b-w4"}} {state["gen"]}',
+        f'vllm:kv_cache_usage_perc{{model_name="gemma31b-w4"}} {min(1.0, 0.05 * state["running"])}',
+        f'vllm:num_requests_running{{model_name="gemma31b-w4"}} {state["running"]}',
+        f'vllm:num_requests_waiting{{model_name="gemma31b-w4"}} 0',
     ]
     return web.Response(text="\n".join(lines) + "\n")
 
 
 async def models(request):
-    return web.json_response({"data": [{"id": "mock"}]})
+    return web.json_response({"data": [{"id": "mock"}, {"id": "gemma31b-w4", "max_model_len": 32768}]})
 
 
 def main():
@@ -114,7 +122,7 @@ def main():
     a = ap.parse_args()
     app = web.Application()
     app.add_routes([web.post("/v1/chat/completions", chat), web.post("/v1/completions", completions),
-                    web.post("/tokenize", tokenize), web.get("/metrics", metrics), web.get("/v1/models", models)])
+                    web.post("/tokenize", tokenize), web.get("/health", models), web.get("/metrics", metrics), web.get("/v1/models", models)])
     web.run_app(app, port=a.port, print=None)
 
 
